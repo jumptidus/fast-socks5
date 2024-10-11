@@ -695,13 +695,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
         let peer_sock = UdpSocket::bind("[::]:0").await?;
 
         // Respect the pre-populated reply IP address.
+        let reply_ip = if let Some(ip) = self.reply_ip {
+            ip
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        };
+
         self.inner
             .write(&new_reply(
                 &ReplyError::Succeeded,
-                SocketAddr::new(
-                    self.reply_ip.context("invalid reply ip")?,
-                    peer_sock.local_addr()?.port(),
-                ),
+                SocketAddr::new(reply_ip, peer_sock.local_addr()?.port()),
             ))
             .await
             .context("Can't write successful reply")?;
