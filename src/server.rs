@@ -693,14 +693,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
         // Listen with UDP6 socket, so the client can connect to it with either
         // IPv4 or IPv6.
-        let peer_sock = UdpSocket::bind("[::]:0").await?;
+        let peer_sock = UdpSocket::bind("0.0.0.0:0").await?;
         debug!("UDP socket bound to {}", peer_sock.local_addr()?);
 
         // Respect the pre-populated reply IP address.
         let reply_ip = if let Some(ip) = self.reply_ip {
             ip
         } else {
-            peer_sock.local_addr()?.ip()
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
 
         debug!("Using reply IP: {}", reply_ip);
