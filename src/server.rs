@@ -713,7 +713,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
             .await
             .context("Can't write successful reply")?;
 
-        debug!("Wrote success");
+        debug!(
+            "Wrote success reply with IP: {}, Port: {}",
+            reply_ip,
+            peer_sock.local_addr()?.port()
+        );
 
         match transfer_udp(peer_sock).await {
             Ok(_) => debug!("UDP transfer completed successfully"),
@@ -768,6 +772,7 @@ async fn handle_udp_request(inbound: &UdpSocket, outbound: &UdpSocket) -> Result
     debug!("Entering handle_udp_request");
     let mut buf = vec![0u8; 0x10000];
     loop {
+        debug!("Waiting for UDP packet on inbound socket...");
         match inbound.recv_from(&mut buf).await {
             Ok((size, client_addr)) => {
                 debug!("Server recieve udp from {}", client_addr);
@@ -827,7 +832,10 @@ async fn transfer_udp(inbound: UdpSocket) -> Result<()> {
     let res_fut = handle_udp_response(&inbound, &outbound);
     match try_join!(req_fut, res_fut) {
         Ok(_) => {}
-        Err(error) => return Err(error),
+        Err(error) => {
+            error!("UDP transfer error: {:?}", error);
+            return Err(error);
+        }
     }
 
     Ok(())
