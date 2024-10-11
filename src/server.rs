@@ -700,7 +700,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
         let reply_ip = if let Some(ip) = self.reply_ip {
             ip
         } else {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            peer_sock.local_addr()?.ip()
         };
 
         debug!("Using reply IP: {}", reply_ip);
