@@ -681,6 +681,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
     /// Bind to a random UDP port, wait for the traffic from
     /// the client, and then forward the data to the remote addr.
     async fn execute_command_udp_assoc(&mut self) -> Result<()> {
+        debug!("Starting UDP ASSOCIATE command");
         // The DST.ADDR and DST.PORT fields contain the address and port that
         // the client expects to use to send UDP datagrams on for the
         // association. The server MAY use this information to limit access
@@ -693,6 +694,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
         // Listen with UDP6 socket, so the client can connect to it with either
         // IPv4 or IPv6.
         let peer_sock = UdpSocket::bind("[::]:0").await?;
+        debug!("UDP socket bound to {}", peer_sock.local_addr()?);
 
         // Respect the pre-populated reply IP address.
         let reply_ip = if let Some(ip) = self.reply_ip {
@@ -700,6 +702,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
         } else {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
+
+        debug!("Using reply IP: {}", reply_ip);
 
         self.inner
             .write(&new_reply(
@@ -711,7 +715,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
         debug!("Wrote success");
 
-        transfer_udp(peer_sock).await?;
+        match transfer_udp(peer_sock).await {
+            Ok(_) => debug!("UDP transfer completed successfully"),
+            Err(e) => error!("UDP transfer error: {:?}", e),
+        }
 
         Ok(())
     }
@@ -758,42 +765,58 @@ where
 }
 
 async fn handle_udp_request(inbound: &UdpSocket, outbound: &UdpSocket) -> Result<()> {
+    debug!("Entering handle_udp_request");
     let mut buf = vec![0u8; 0x10000];
     loop {
-        let (size, client_addr) = inbound.recv_from(&mut buf).await?;
-        debug!("Server recieve udp from {}", client_addr);
-        inbound.connect(client_addr).await?;
+        match inbound.recv_from(&mut buf).await {
+            Ok((size, client_addr)) => {
+                debug!("Server recieve udp from {}", client_addr);
+                inbound.connect(client_addr).await?;
 
-        let (frag, target_addr, data) = parse_udp_request(&buf[..size]).await?;
+                let (frag, target_addr, data) = parse_udp_request(&buf[..size]).await?;
 
-        if frag != 0 {
-            debug!("Discard UDP frag packets sliently.");
-            return Ok(());
+                if frag != 0 {
+                    debug!("Discard UDP frag packets sliently.");
+                    return Ok(());
+                }
+
+                debug!("Server forward to packet to {}", target_addr);
+                let mut target_addr = target_addr
+                    .to_socket_addrs()?
+                    .next()
+                    .context("unreachable")?;
+
+                target_addr.set_ip(match target_addr.ip() {
+                    std::net::IpAddr::V4(v4) => std::net::IpAddr::V6(v4.to_ipv6_mapped()),
+                    v6 @ std::net::IpAddr::V6(_) => v6,
+                });
+                outbound.send_to(data, target_addr).await?;
+            }
+            Err(e) => {
+                error!("Error receiving UDP packet: {:?}", e);
+                return Err(e.into());
+            }
         }
-
-        debug!("Server forward to packet to {}", target_addr);
-        let mut target_addr = target_addr
-            .to_socket_addrs()?
-            .next()
-            .context("unreachable")?;
-
-        target_addr.set_ip(match target_addr.ip() {
-            std::net::IpAddr::V4(v4) => std::net::IpAddr::V6(v4.to_ipv6_mapped()),
-            v6 @ std::net::IpAddr::V6(_) => v6,
-        });
-        outbound.send_to(data, target_addr).await?;
     }
 }
 
 async fn handle_udp_response(inbound: &UdpSocket, outbound: &UdpSocket) -> Result<()> {
+    debug!("Entering handle_udp_response");
     let mut buf = vec![0u8; 0x10000];
     loop {
-        let (size, remote_addr) = outbound.recv_from(&mut buf).await?;
-        debug!("Recieve packet from {}", remote_addr);
+        match outbound.recv_from(&mut buf).await {
+            Ok((size, remote_addr)) => {
+                debug!("Recieve packet from {}", remote_addr);
 
-        let mut data = new_udp_header(remote_addr)?;
-        data.extend_from_slice(&buf[..size]);
-        inbound.send(&data).await?;
+                let mut data = new_udp_header(remote_addr)?;
+                data.extend_from_slice(&buf[..size]);
+                inbound.send(&data).await?;
+            }
+            Err(e) => {
+                error!("Error receiving UDP response: {:?}", e);
+                return Err(e.into());
+            }
+        }
     }
 }
 
