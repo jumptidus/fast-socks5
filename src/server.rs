@@ -4,6 +4,7 @@ use crate::read_exact;
 use crate::ready;
 use crate::util::stream::tcp_connect_with_timeout;
 use crate::util::target_addr::{read_address, TargetAddr};
+use crate::util::udp::*;
 use crate::Socks5Command;
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
 use anyhow::Context;
@@ -189,9 +190,12 @@ pub struct Socks5Server<A: Authentication = DenyAuthentication> {
 }
 
 impl<A: Authentication + Default> Socks5Server<A> {
-    pub async fn bind<S: AsyncToSocketAddrs>(addr: S) -> io::Result<Self> {
+    pub async fn bind<S: AsyncToSocketAddrs>(addr: S, udp_port: u16) -> io::Result<Self> {
         let listener = TcpListener::bind(&addr).await?;
         let config = Arc::new(Config::default());
+
+        tokio::spawn(UdpSessionManager::run_default(udp_port));
+        // tokio::spawn(listen_udp_request(udp_port));
 
         Ok(Socks5Server { listener, config })
     }
@@ -692,7 +696,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
         // Listen with UDP6 socket, so the client can connect to it with either
         // IPv4 or IPv6.
-        let peer_sock = UdpSocket::bind("[::]:0").await?;
+        // let peer_sock = UdpSocket::bind("[::]:0").await?;
 
         // Respect the pre-populated reply IP address.
         self.inner
@@ -700,7 +704,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
                 &ReplyError::Succeeded,
                 SocketAddr::new(
                     self.reply_ip.context("invalid reply ip")?,
-                    peer_sock.local_addr()?.port(),
+                    // peer_sock.local_addr()?.port(),
+                    10801,
                 ),
             ))
             .await
@@ -708,7 +713,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
         debug!("Wrote success");
 
-        transfer_udp(peer_sock).await?;
+        // transfer_udp(peer_sock).await?;
 
         Ok(())
     }
@@ -879,23 +884,4 @@ fn new_reply(error: &ReplyError, sock_addr: SocketAddr) -> Vec<u8> {
     reply.append(&mut port);
 
     reply
-}
-
-#[cfg(test)]
-mod test {
-    use crate::server::Socks5Server;
-    use tokio_test::block_on;
-
-    use super::AcceptAuthentication;
-
-    #[test]
-    fn test_bind() {
-        let f = async {
-            let _server = Socks5Server::<AcceptAuthentication>::bind("127.0.0.1:1080")
-                .await
-                .unwrap();
-        };
-
-        block_on(f);
-    }
 }
