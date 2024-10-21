@@ -3,93 +3,187 @@ use dashmap::{DashMap, DashSet};
 use std::{
     net::{SocketAddr, ToSocketAddrs},
     sync::Arc,
+    time::{Duration, Instant},
 };
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::oneshot, task::JoinHandle};
 
 use crate::{new_udp_header, parse_udp_request};
 
-pub async fn listen_udp_request(udp_port: u16) -> Result<()> {
-    let inbound = Arc::new(UdpSocket::bind(format!("127.0.0.1:{}", udp_port)).await?);
+use super::target_addr::TargetAddr;
 
-    debug!("listen udp request on 127.0.0.1:{}", udp_port);
+struct UdpManager {
+    inbound: Arc<UdpSocket>,
+    outbound_map: Arc<DashMap<String, (Arc<UdpSocket>, Instant)>>,
+    client_map: Arc<DashMap<String, (SocketAddr, Instant)>>,
+    active_outbound_listener_ports: DashSet<u16>,
+    task_handles: DashMap<u16, (JoinHandle<Result<()>>, oneshot::Sender<()>)>,
+}
 
-    let outbound_map: Arc<DashMap<String, Arc<UdpSocket>>> = Arc::new(DashMap::new());
-    let client_map: Arc<DashMap<String, SocketAddr>> = Arc::new(DashMap::new());
-    let active_outbound_listener_ports: DashSet<u16> = DashSet::new();
+impl UdpManager {
+    async fn new(udp_port: u16) -> Result<Self> {
+        let inbound = Arc::new(UdpSocket::bind(format!("127.0.0.1:{}", udp_port)).await?);
+        info!("[UDP]listen udp request on 127.0.0.1:{}", udp_port);
 
-    let mut buf = vec![0u8; 0x10000];
-    loop {
-        let (size, client_addr) = inbound.recv_from(&mut buf).await?;
-        debug!("[UDP] Server recieve udp from {}", client_addr);
+        Ok(Self {
+            inbound,
+            outbound_map: Arc::new(DashMap::new()),
+            client_map: Arc::new(DashMap::new()),
+            active_outbound_listener_ports: DashSet::new(),
+            task_handles: DashMap::new(),
+        })
+    }
 
+    async fn handle_inbound_packet(
+        &self,
+        buf: &[u8],
+        size: usize,
+        client_addr: SocketAddr,
+    ) -> Result<()> {
         let (frag, target_addr, data) = parse_udp_request(&buf[..size]).await?;
 
         if frag != 0 {
-            debug!("[UDP] Discard UDP frag packets sliently.");
+            debug!("[UDP] Discard UDP frag packets silently.");
             return Ok(());
         }
 
-        debug!("Server forward to packet to {}", target_addr);
+        trace!("[UDP]Server forward packet to {}", target_addr);
 
-        let mut target_addr = target_addr
+        let target_addr = self.normalize_target_addr(target_addr)?;
+        let outbound_key = self.generate_outbound_key(&target_addr, &client_addr);
+
+        self.process_outbound(outbound_key, target_addr, client_addr, data)
+            .await
+    }
+
+    fn normalize_target_addr(&self, target_addr: TargetAddr) -> Result<SocketAddr> {
+        let mut addr = target_addr
             .to_socket_addrs()?
             .next()
             .context("unreachable")?;
-
-        target_addr.set_ip(match target_addr.ip() {
+        addr.set_ip(match addr.ip() {
             std::net::IpAddr::V4(v4) => std::net::IpAddr::V6(v4.to_ipv6_mapped()),
             v6 @ std::net::IpAddr::V6(_) => v6,
         });
+        Ok(addr)
+    }
 
-        let outbound_key = format!(
+    fn generate_outbound_key(&self, target_addr: &SocketAddr, client_addr: &SocketAddr) -> String {
+        format!(
             "{}:{}:{}:{}",
             target_addr.ip(),
             target_addr.port(),
             client_addr.ip(),
             client_addr.port()
-        );
-        if let Some(outbound) = outbound_map.get(&outbound_key) {
-            outbound.send_to(data, target_addr).await?;
-            client_map.insert(
-                format!("{}:{}", target_addr.ip(), outbound.local_addr()?.port()),
-                client_addr,
-            );
+        )
+    }
 
-            if !active_outbound_listener_ports.contains(&outbound.local_addr()?.port()) {
-                active_outbound_listener_ports.insert(outbound.local_addr()?.port());
-                tokio::spawn(listen_udp_response(
-                    inbound.clone(),
-                    outbound.clone(),
-                    client_map.clone(),
-                ));
-            } else {
-                debug!(
-                    "Outbound listener port {} already exists",
-                    outbound.local_addr()?.port()
-                );
-            }
+    async fn process_outbound(
+        &self,
+        outbound_key: String,
+        target_addr: SocketAddr,
+        client_addr: SocketAddr,
+        data: &[u8],
+    ) -> Result<()> {
+        let now = Instant::now();
+        let outbound = if let Some(outbound) = self.outbound_map.get(&outbound_key) {
+            outbound.0.clone()
         } else {
-            let outbound = Arc::new(UdpSocket::bind("[::]:0").await?);
-            outbound.send_to(data, target_addr).await?;
-            client_map.insert(
-                format!("{}:{}", target_addr.ip(), outbound.local_addr()?.port()),
-                client_addr,
+            let new_outbound = Arc::new(UdpSocket::bind("[::]:0").await?);
+            self.outbound_map
+                .insert(outbound_key, (new_outbound.clone(), now));
+            new_outbound
+        };
+
+        outbound.send_to(data, target_addr).await?;
+        self.client_map.insert(
+            format!("{}:{}", target_addr.ip(), outbound.local_addr()?.port()),
+            (client_addr, now),
+        );
+        trace!(
+            "[UDP] Insert client {}:{} to client map",
+            target_addr.ip(),
+            outbound.local_addr()?.port()
+        );
+
+        self.spawn_listener_if_needed(outbound).await
+    }
+
+    async fn spawn_listener_if_needed(&self, outbound: Arc<UdpSocket>) -> Result<()> {
+        let port = outbound.local_addr()?.port();
+        trace!("[UDP] choose port {} listener", port);
+
+        if !self.active_outbound_listener_ports.contains(&port) {
+            trace!(
+                "[UDP] new outbound listener port {} inserted to active outbound listener ports",
+                port
             );
+            self.active_outbound_listener_ports.insert(port);
+            let inbound = self.inbound.clone();
+            let client_map = self.client_map.clone();
 
-            outbound_map.insert(outbound_key, outbound.clone());
+            let (tx, rx) = oneshot::channel();
+            let handle = tokio::spawn(listen_udp_response(inbound, outbound, client_map, rx));
+            self.task_handles.insert(port, (handle, tx));
+        } else {
+            trace!("[UDP] outbound listener port {} already running", port);
+        }
+        Ok(())
+    }
 
-            if !active_outbound_listener_ports.contains(&outbound.local_addr()?.port()) {
-                active_outbound_listener_ports.insert(outbound.local_addr()?.port());
-                tokio::spawn(listen_udp_response(
-                    inbound.clone(),
-                    outbound.clone(),
-                    client_map.clone(),
-                ));
+    fn cleanup_expired_sockets(&self, timeout: Duration) {
+        trace!(
+            "Cleanup expired sockets, sockets: {}, clients: {}",
+            self.outbound_map.len(),
+            self.client_map.len(),
+        );
+
+        let now = Instant::now();
+
+        self.outbound_map.retain(|_, (socket, last_used)| {
+            if now.duration_since(*last_used) > timeout {
+                if let Ok(addr) = socket.local_addr() {
+                    self.active_outbound_listener_ports.remove(&addr.port());
+                    if let Some((_, (handle, tx))) = self.task_handles.remove(&addr.port()) {
+                        trace!("Remove listener for port {}", addr.port());
+
+                        let result = tx.send(());
+
+                        if result.is_err() {
+                            warn!(
+                                "Failed to send stop signal to listener for port {}, force stop!",
+                                addr.port()
+                            );
+
+                            let _ = handle.abort(); // force stop the listener
+                        }
+                    }
+                }
+                false
             } else {
-                debug!(
-                    "Outbound listener port {} already exists",
-                    outbound.local_addr()?.port()
-                );
+                true
+            }
+        });
+
+        self.client_map
+            .retain(|_, (_, last_used)| now.duration_since(*last_used) <= timeout)
+    }
+}
+
+pub async fn listen_udp_request(udp_port: u16, cleanup_interval: u64, timeout: u64) -> Result<()> {
+    let state = UdpManager::new(udp_port).await?;
+    let cleanup_interval = Duration::from_secs(cleanup_interval);
+    let timeout = Duration::from_secs(timeout);
+
+    let mut buf = vec![0u8; 0x10000];
+    loop {
+        tokio::select! {
+            result = state.inbound.recv_from(&mut buf) => {
+                let (size, client_addr) = result?;
+                trace!("[UDP] Server receive udp from {}", client_addr);
+                state.handle_inbound_packet(&buf, size, client_addr).await?;
+            }
+            _ = tokio::time::sleep(cleanup_interval) => {
+                state.cleanup_expired_sockets(timeout);
             }
         }
     }
@@ -98,21 +192,47 @@ pub async fn listen_udp_request(udp_port: u16) -> Result<()> {
 async fn listen_udp_response(
     inbound: Arc<UdpSocket>,
     outbound: Arc<UdpSocket>,
-    client_map: Arc<DashMap<String, SocketAddr>>,
+    client_map: Arc<DashMap<String, (SocketAddr, Instant)>>,
+    mut stop_signal: oneshot::Receiver<()>,
 ) -> Result<()> {
+    debug!(
+        "[UDP] start listening udp response on {}",
+        outbound.local_addr()?.port()
+    );
+
     let mut buf = vec![0u8; 0x10000];
+
     loop {
-        let (size, remote_addr) = outbound.recv_from(&mut buf).await?;
-        debug!("Recieve packet from {}", remote_addr);
+        tokio::select! {
+            result = outbound.recv_from(&mut buf) => {
+                let (size, remote_addr) = result?;
+                trace!("[UDP] Receive packet from {}", remote_addr);
 
-        let mut data = new_udp_header(remote_addr)?;
-        data.extend_from_slice(&buf[..size]);
+                let mut data = new_udp_header(remote_addr)?;
+                data.extend_from_slice(&buf[..size]);
 
-        let client_key = format!("{}:{}", remote_addr.ip(), outbound.local_addr()?.port());
-        if let Some(client_addr) = client_map.get(&client_key) {
-            inbound.send_to(&data, *client_addr).await?;
-        } else {
-            warn!("No client found for {}", client_key);
+                let client_key = format!("{}:{}", remote_addr.ip(), outbound.local_addr()?.port());
+
+                if let Some(mut entry) = client_map.get_mut(&client_key) {
+                    let (client_addr, ref mut last_used) = entry.value_mut();
+                    inbound.send_to(&data, *client_addr).await?;
+                    *last_used = Instant::now();
+                } else {
+                    warn!("No client found for {}", client_key);
+                }
+            }
+            _ = &mut stop_signal => {
+                trace!(
+                    "[UDP] Stop signal received, stopping udp response listener {}",
+                    outbound.local_addr()?.port()
+                );
+                break;
+            }
         }
     }
+    trace!(
+        "[UDP] listener for port {} stopped successfully",
+        outbound.local_addr()?.port()
+    );
+    Ok(())
 }

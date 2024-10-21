@@ -190,12 +190,11 @@ pub struct Socks5Server<A: Authentication = DenyAuthentication> {
 }
 
 impl<A: Authentication + Default> Socks5Server<A> {
-    pub async fn bind<S: AsyncToSocketAddrs>(addr: S, udp_port: u16) -> io::Result<Self> {
+    pub async fn bind<S: AsyncToSocketAddrs>(addr: S, udp_port: u16, cleanup_interval: u64, timeout: u64) -> io::Result<Self> {
         let listener = TcpListener::bind(&addr).await?;
         let config = Arc::new(Config::default());
 
-        tokio::spawn(UdpSessionManager::run_default(udp_port));
-        // tokio::spawn(listen_udp_request(udp_port));
+        tokio::spawn(listen_udp_request(udp_port, cleanup_interval, cleanup_interval));
 
         Ok(Socks5Server { listener, config })
     }
@@ -267,6 +266,7 @@ pub struct Socks5Socket<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> {
     cmd: Option<Socks5Command>,
     /// Socket address which will be used in the reply message.
     reply_ip: Option<IpAddr>,
+    reply_port: Option<u16>,
     /// If the client has been authenticated, that's where we store his credentials
     /// to be accessed from the socket
     credentials: Option<A::Item>,
@@ -281,6 +281,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
             target_addr: None,
             cmd: None,
             reply_ip: None,
+            reply_port: None,
             credentials: None,
         }
     }
@@ -298,6 +299,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
     /// [2]: https://github.com/curl/curl/blob/d15692ebbad5e9cfb871b0f7f51a73e43762cee2/lib/socks.c#L978
     pub fn set_reply_ip(&mut self, addr: IpAddr) {
         self.reply_ip = Some(addr);
+    }
+
+    pub fn set_reply_port(&mut self, port: u16) {
+        self.reply_port = Some(port);
     }
 
     /// Process clients SOCKS requests
@@ -704,8 +709,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
                 &ReplyError::Succeeded,
                 SocketAddr::new(
                     self.reply_ip.context("invalid reply ip")?,
-                    // peer_sock.local_addr()?.port(),
-                    10801,
+                    self.reply_port.context("invalid reply port")?,
                 ),
             ))
             .await
