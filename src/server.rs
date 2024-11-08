@@ -190,11 +190,16 @@ pub struct Socks5Server<A: Authentication = DenyAuthentication> {
 }
 
 impl<A: Authentication + Default> Socks5Server<A> {
-    pub async fn bind<S: AsyncToSocketAddrs>(addr: S, udp_port: u16, cleanup_interval: u64, timeout: u64) -> io::Result<Self> {
+    pub async fn bind<S: AsyncToSocketAddrs>(
+        addr: S,
+        udp_port: u16,
+        cleanup_interval: u64,
+        timeout: u64,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(&addr).await?;
         let config = Arc::new(Config::default());
 
-        tokio::spawn(listen_udp_request(udp_port, cleanup_interval, cleanup_interval));
+        tokio::spawn(listen_udp_request(udp_port, cleanup_interval, timeout));
 
         Ok(Socks5Server { listener, config })
     }

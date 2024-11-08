@@ -170,6 +170,26 @@ impl UdpManager {
 }
 
 pub async fn listen_udp_request(udp_port: u16, cleanup_interval: u64, timeout: u64) -> Result<()> {
+    loop {
+        match run_udp_server(udp_port, cleanup_interval, timeout).await {
+            Ok(_) => {
+                error!("[UDP] Server stopped unexpectedly");
+            }
+            Err(e) => {
+                error!(
+                    "[UDP] Server error: {:?}, attempting restart in 5 seconds",
+                    e
+                );
+            }
+        }
+
+        // 等待5秒后重试
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        info!("[UDP] Attempting to restart UDP server...");
+    }
+}
+
+async fn run_udp_server(udp_port: u16, cleanup_interval: u64, timeout: u64) -> Result<()> {
     let state = UdpManager::new(udp_port).await?;
     let cleanup_interval = Duration::from_secs(cleanup_interval);
     let timeout = Duration::from_secs(timeout);
@@ -178,15 +198,26 @@ pub async fn listen_udp_request(udp_port: u16, cleanup_interval: u64, timeout: u
     loop {
         tokio::select! {
             result = state.inbound.recv_from(&mut buf) => {
-                let (size, client_addr) = result?;
-                trace!("[UDP] Server receive udp from {}", client_addr);
-                state.handle_inbound_packet(&buf, size, client_addr).await?;
+                if let Err(e) = handle_recv_result(&state, &buf, result).await {
+                    error!("[UDP] Error handling packet: {:?}", e);
+                    continue;
+                }
             }
             _ = tokio::time::sleep(cleanup_interval) => {
                 state.cleanup_expired_sockets(timeout);
             }
         }
     }
+}
+
+async fn handle_recv_result(
+    state: &UdpManager,
+    buf: &[u8],
+    result: std::io::Result<(usize, SocketAddr)>,
+) -> Result<()> {
+    let (size, client_addr) = result?;
+    trace!("[UDP] Server receive udp from {}", client_addr);
+    state.handle_inbound_packet(buf, size, client_addr).await
 }
 
 async fn listen_udp_response(

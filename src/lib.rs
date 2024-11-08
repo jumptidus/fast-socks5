@@ -400,6 +400,12 @@ mod test {
     }
 
     #[test]
+    fn test_server() {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(setup_socks_server("127.0.0.1:10800", None, tx));
+    }
+
+    #[test]
     fn mock_udp_assosiate_no_auth() {
         init();
         block_on(async {
