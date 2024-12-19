@@ -1,6 +1,6 @@
 use anyhow::Result;
 use once_cell::sync::OnceCell;
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Duration};
 use trust_dns_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
@@ -32,8 +32,10 @@ async fn get_resolver() -> Result<&'static TokioAsyncResolver> {
         config.add_name_server(NameServerConfig::new("8.8.8.8:53".parse()?, Protocol::Udp));
 
         let mut opts = ResolverOpts::default();
-        opts.timeout = std::time::Duration::from_secs(3);
-        opts.attempts = 1;
+        opts.timeout = std::time::Duration::from_secs(3); // 超时3秒
+        opts.positive_max_ttl = Some(Duration::from_secs(600)); // 成功解析缓存600秒
+        opts.negative_max_ttl = Some(Duration::from_secs(300)); // 失败解析缓存300秒
+        opts.attempts = 1; // 只尝试一次
 
         let resolver = TokioAsyncResolver::tokio(config, opts);
         DNS_RESOLVER.set(resolver).unwrap();
