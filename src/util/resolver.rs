@@ -17,6 +17,10 @@ async fn get_resolver() -> Result<&'static TokioAsyncResolver> {
             "114.114.114.114:53".parse()?,
             Protocol::Udp,
         ));
+        config.add_name_server(NameServerConfig::new(
+            "223.6.6.6:53".parse()?,
+            Protocol::Udp,
+        ));
 
         let mut opts = ResolverOpts::default();
         opts.timeout = std::time::Duration::from_secs(3);
