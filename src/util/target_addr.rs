@@ -1,6 +1,7 @@
 use crate::consts;
 use crate::consts::SOCKS5_ADDR_TYPE_IPV4;
 use crate::read_exact;
+use crate::util::resolver;
 use crate::SocksError;
 use anyhow::Context;
 use std::fmt;
@@ -53,15 +54,21 @@ impl TargetAddr {
             TargetAddr::Domain(domain, port) => {
                 debug!("Attempt to DNS resolve the domain {}...", &domain);
 
-                let socket_addr = lookup_host((&domain[..], port))
-                    .await
-                    .context(AddrError::DNSResolutionFailed)?
-                    .next()
-                    .ok_or(AddrError::Custom(
-                        "Can't fetch DNS to the domain.".to_string(),
-                    ))?;
-                debug!("domain name resolved to {}", socket_addr);
+                let ips = resolver::resolve(&domain).await?;
+                trace!("domain {} resolved to ips: {:?}", domain, ips);
+                let ip = ips.into_iter().next().ok_or(AddrError::Custom(
+                    "Can't fetch DNS to the domain.".to_string(),
+                ))?;
+                let socket_addr = SocketAddr::new(ip, port);
 
+                // let socket_addr = lookup_host((&domain[..], port))
+                //     .await
+                //     .context(AddrError::DNSResolutionFailed)?
+                //     .next()
+                //     .ok_or(AddrError::Custom(
+                //         "Can't fetch DNS to the domain.".to_string(),
+                //     ))?;
+                debug!("domain name resolved to {}", socket_addr);
                 // has been converted to an ip
                 Ok(TargetAddr::Ip(socket_addr))
             }
