@@ -55,7 +55,7 @@ impl TargetAddr {
                 debug!("Attempt to DNS resolve the domain {}...", &domain);
 
                 let ips = resolver::resolve(&domain).await?;
-                trace!("domain {} resolved to ips: {:?}", domain, ips);
+                debug!("domain {} resolved to ips: {:?}", domain, ips);
                 let ip = ips.into_iter().next().ok_or(AddrError::Custom(
                     "Can't fetch DNS to the domain.".to_string(),
                 ))?;

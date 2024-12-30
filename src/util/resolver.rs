@@ -1,6 +1,9 @@
 use anyhow::Result;
 use once_cell::sync::OnceCell;
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    time::Duration,
+};
 use trust_dns_resolver::{
     config::{LookupIpStrategy, NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
@@ -33,20 +36,26 @@ async fn get_resolver() -> Result<&'static TokioAsyncResolver> {
 
         let mut opts = ResolverOpts::default();
         opts.timeout = std::time::Duration::from_secs(3); // 超时3秒
-        opts.ip_strategy = LookupIpStrategy::Ipv4Only; // 只解析ipv4
+        opts.ip_strategy = LookupIpStrategy::Ipv4thenIpv6; // 先解析ipv4，再解析ipv6
         opts.positive_max_ttl = Some(Duration::from_secs(600)); // 成功解析缓存600秒
         opts.negative_max_ttl = Some(Duration::from_secs(300)); // 失败解析缓存300秒
-        opts.attempts = 1; // 只尝试一次
 
         let resolver = TokioAsyncResolver::tokio(config, opts);
-        DNS_RESOLVER.set(resolver).unwrap();
+        DNS_RESOLVER
+            .set(resolver)
+            .map_err(|e| anyhow::anyhow!("Failed to set DNS resolver: {:?}", e))?;
     }
 
-    Ok(DNS_RESOLVER.get().unwrap())
+    Ok(DNS_RESOLVER
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("DNS resolver not initialized"))?)
 }
 
 // 单个公共方法用于DNS解析
 pub async fn resolve(domain: &str) -> Result<Vec<IpAddr>> {
+    if domain == "0" {
+        return Ok(vec![IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))]);
+    }
     let resolver = get_resolver().await?;
     let response = resolver.lookup_ip(domain).await?;
     Ok(response.iter().collect())
@@ -58,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns() {
-        let ips = resolve("www.baidu.com").await.unwrap();
+        let ips = resolve("0").await.unwrap();
         println!("Resolved IPs: {:?}", ips);
     }
 }

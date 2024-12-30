@@ -597,15 +597,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
             None => return Err(ReplyError::CommandNotSupported.into()),
             Some(cmd) => match cmd {
                 Socks5Command::TCPConnect => {
+                    debug!("TCP connect.");
                     self.cmd = Some(cmd);
                 }
                 Socks5Command::UDPAssociate => {
+                    debug!("UDP associate.");
                     if !self.config.allow_udp {
                         return Err(ReplyError::CommandNotSupported.into());
                     }
                     self.cmd = Some(cmd);
                 }
-                Socks5Command::TCPBind => return Err(ReplyError::CommandNotSupported.into()),
+                Socks5Command::TCPBind => {
+                    debug!("TCP bind.");
+                    return Err(ReplyError::CommandNotSupported.into());
+                }
             },
         }
 
@@ -631,6 +636,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
     pub async fn resolve_dns(&mut self) -> Result<()> {
         trace!("resolving dns");
         if let Some(target_addr) = self.target_addr.take() {
+            debug!("match target_addr: {:?}", target_addr);
             // decide whether we have to resolve DNS or not
             self.target_addr = match target_addr {
                 TargetAddr::Domain(_, _) => Some(target_addr.resolve_dns().await?),
