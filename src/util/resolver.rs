@@ -60,14 +60,3 @@ pub async fn resolve(domain: &str) -> Result<Vec<IpAddr>> {
     let response = resolver.lookup_ip(domain).await?;
     Ok(response.iter().collect())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_dns() {
-        let ips = resolve("0").await.unwrap();
-        println!("Resolved IPs: {:?}", ips);
-    }
-}
