@@ -20,6 +20,7 @@ use std::task::{Context as AsyncContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs as AsyncToSocketAddrs};
+use tokio::task::JoinHandle;
 use tokio::try_join;
 use tokio_stream::Stream;
 
@@ -186,6 +187,7 @@ impl<A: Authentication> Config<A> {
 /// Useful if you don't use any existing TcpListener's streams.
 pub struct Socks5Server<A: Authentication = DenyAuthentication> {
     listener: TcpListener,
+    udp_join_handle: JoinHandle<anyhow::Result<()>>,
     config: Arc<Config<A>>,
 }
 
@@ -199,20 +201,48 @@ impl<A: Authentication + Default> Socks5Server<A> {
         let listener = TcpListener::bind(&addr).await?;
         let config = Arc::new(Config::default());
 
-        tokio::spawn(listen_udp_request(udp_port, cleanup_interval, timeout));
+        match run_udp_server(udp_port, cleanup_interval, timeout).await {
+            Ok(udp_join_handle) => {
+                info!("[UDP] UDP server started..");
+                Ok(Socks5Server {
+                    listener,
+                    config,
+                    udp_join_handle,
+                })
+            }
+            Err(e) => {
+                error!(
+                    "[UDP] Server error: {:?}, attempting restart in 5 seconds",
+                    e
+                );
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "UDP server bind error",
+                ))
+            }
+        }
+    }
 
-        Ok(Socks5Server { listener, config })
+    pub fn update_config(&mut self, config: Config<A>) {
+        self.config = Arc::new(config);
+    }
+}
+
+impl<A: Authentication> Drop for Socks5Server<A> {
+    fn drop(&mut self) {
+        self.udp_join_handle.abort();
     }
 }
 
 impl<A: Authentication> Socks5Server<A> {
     /// Set a custom config
-    pub fn with_config<T: Authentication>(self, config: Config<T>) -> Socks5Server<T> {
-        Socks5Server {
-            listener: self.listener,
-            config: Arc::new(config),
-        }
-    }
+    // pub fn with_config<T: Authentication>(self, config: Config<T>) -> Socks5Server<T> {
+    //     Socks5Server {
+    //         listener: self.listener,
+    //         config: Arc::new(config),
+    //         udp_join_handle: self.udp_join_handle,
+    //     }
+    // }
 
     /// Can loop on `incoming().next()` to iterate over incoming connections.
     pub fn incoming(&self) -> Incoming<'_, A> {

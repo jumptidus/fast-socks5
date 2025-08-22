@@ -21,16 +21,22 @@ struct UdpManager {
 
 impl UdpManager {
     async fn new(udp_port: u16) -> Result<Self> {
-        let inbound = Arc::new(UdpSocket::bind(format!("127.0.0.1:{}", udp_port)).await?);
-        info!("[UDP]listen udp request on 127.0.0.1:{}", udp_port);
+        let udp_addr = format!("127.0.0.1:{}", udp_port);
+        if let Ok(udp_socket) = UdpSocket::bind(&udp_addr).await {
+            let inbound = Arc::new(udp_socket);
+            info!("[UDP]listen udp request on {}", &udp_addr);
 
-        Ok(Self {
-            inbound,
-            outbound_map: Arc::new(DashMap::new()),
-            client_map: Arc::new(DashMap::new()),
-            active_outbound_listener_ports: DashSet::new(),
-            task_handles: DashMap::new(),
-        })
+            Ok(Self {
+                inbound,
+                outbound_map: Arc::new(DashMap::new()),
+                client_map: Arc::new(DashMap::new()),
+                active_outbound_listener_ports: DashSet::new(),
+                task_handles: DashMap::new(),
+            })
+        } else {
+            error!("[UDP] Failed to bind UDP port {}", &udp_addr);
+            anyhow::bail!("[UDP] Failed to bind UDP port {}", &udp_addr);
+        }
     }
 
     async fn handle_inbound_packet(
@@ -189,24 +195,36 @@ pub async fn listen_udp_request(udp_port: u16, cleanup_interval: u64, timeout: u
     }
 }
 
-async fn run_udp_server(udp_port: u16, cleanup_interval: u64, timeout: u64) -> Result<()> {
-    let state = UdpManager::new(udp_port).await?;
-    let cleanup_interval = Duration::from_secs(cleanup_interval);
-    let timeout = Duration::from_secs(timeout);
+pub async fn run_udp_server(
+    udp_port: u16,
+    cleanup_interval: u64,
+    timeout: u64,
+) -> Result<JoinHandle<Result<()>>> {
+    if let Ok(udp_manager) = UdpManager::new(udp_port).await {
+        let udp_join_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
+            let cleanup_interval = Duration::from_secs(cleanup_interval);
+            let timeout = Duration::from_secs(timeout);
 
-    let mut buf = vec![0u8; 0x10000];
-    loop {
-        tokio::select! {
-            result = state.inbound.recv_from(&mut buf) => {
-                if let Err(e) = handle_recv_result(&state, &buf, result).await {
-                    error!("[UDP] Error handling packet: {:?}", e);
-                    continue;
+            let mut buf = vec![0u8; 0x10000];
+            let mut tick = tokio::time::interval(cleanup_interval);
+            loop {
+                tokio::select! {
+                    result = udp_manager.inbound.recv_from(&mut buf) => {
+                        if let Err(e) = handle_recv_result(&udp_manager, &buf, result).await {
+                            error!("[UDP] Error handling packet: {:?}", e);
+                            continue;
+                        }
+                    }
+                    _ = tick.tick() => {
+                        udp_manager.cleanup_expired_sockets(timeout);
+                    }
                 }
             }
-            _ = tokio::time::sleep(cleanup_interval) => {
-                state.cleanup_expired_sockets(timeout);
-            }
-        }
+        });
+        Ok(udp_join_handle)
+    } else {
+        error!("[UDP] Failed to create UDP manager for port {}", &udp_port);
+        anyhow::bail!("[UDP] Failed to create UDP manager for port {}", &udp_port);
     }
 }
 
