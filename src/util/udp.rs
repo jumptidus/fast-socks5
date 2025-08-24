@@ -206,7 +206,11 @@ pub async fn run_udp_server(
             let timeout = Duration::from_secs(timeout);
 
             let mut buf = vec![0u8; 0x10000];
+
+            // 设置清理间隔，并跳过错过的时间
             let mut tick = tokio::time::interval(cleanup_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             loop {
                 tokio::select! {
                     result = udp_manager.inbound.recv_from(&mut buf) => {
