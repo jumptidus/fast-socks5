@@ -54,18 +54,20 @@ impl UdpManager {
 
         trace!("[UDP]Server forward packet to {}", target_addr);
 
-        let target_addr = self.normalize_target_addr(target_addr)?;
+        let target_addr = self.normalize_target_addr(target_addr).await?;
         let outbound_key = self.generate_outbound_key(&target_addr, &client_addr);
 
         self.process_outbound(outbound_key, target_addr, client_addr, data)
             .await
     }
 
-    fn normalize_target_addr(&self, target_addr: TargetAddr) -> Result<SocketAddr> {
-        let mut addr = target_addr
-            .to_socket_addrs()?
-            .next()
-            .context("unreachable")?;
+    async fn normalize_target_addr(&self, target_addr: TargetAddr) -> Result<SocketAddr> {
+        let resolved_addr = match target_addr {
+            TargetAddr::Domain(_, _) => target_addr.resolve_dns().await?,
+            ip @ TargetAddr::Ip(_) => ip,
+        };
+
+        let mut addr = resolved_addr.to_socket_addrs()?.next().context("unreachable")?;
         addr.set_ip(match addr.ip() {
             std::net::IpAddr::V4(v4) => std::net::IpAddr::V6(v4.to_ipv6_mapped()),
             v6 @ std::net::IpAddr::V6(_) => v6,
@@ -91,8 +93,9 @@ impl UdpManager {
         data: &[u8],
     ) -> Result<()> {
         let now = Instant::now();
-        let outbound = if let Some(outbound) = self.outbound_map.get(&outbound_key) {
-            outbound.0.clone()
+        let outbound = if let Some(mut entry) = self.outbound_map.get_mut(&outbound_key) {
+            entry.value_mut().1 = now;
+            entry.value().0.clone()
         } else {
             let new_outbound = Arc::new(UdpSocket::bind("[::]:0").await?);
             self.outbound_map
