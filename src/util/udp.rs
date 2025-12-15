@@ -18,7 +18,7 @@ use super::target_addr::TargetAddr;
 const UDP_BUFFER_SIZE: usize = 0x10000; // 64KB
 
 /// 全局最大 outbound socket 数量，防止资源耗尽
-const MAX_OUTBOUND_SOCKETS: usize = 1024;
+const MAX_OUTBOUND_SOCKETS: usize = 512;
 
 // ============================================================================
 // 类型定义
@@ -159,37 +159,35 @@ impl UdpManager {
     ) -> Result<()> {
         let now = Instant::now();
 
-        let (outbound, local_port) = if let Some(mut entry) = self.outbound_map.get_mut(&outbound_key) {
-            // 刷新 last_used (index 2)
-            entry.value_mut().2 = now;
-            (entry.value().0.clone(), entry.value().1)
-        } else {
-            // 检查资源上限
-            if self.outbound_map.len() >= MAX_OUTBOUND_SOCKETS {
-                anyhow::bail!(
-                    "[UDP] 已达到最大 socket 数量限制 ({})，丢弃请求",
-                    MAX_OUTBOUND_SOCKETS
-                );
-            }
+        let (outbound, local_port) =
+            if let Some(mut entry) = self.outbound_map.get_mut(&outbound_key) {
+                // 刷新 last_used (index 2)
+                entry.value_mut().2 = now;
+                (entry.value().0.clone(), entry.value().1)
+            } else {
+                // 检查资源上限
+                if self.outbound_map.len() >= MAX_OUTBOUND_SOCKETS {
+                    anyhow::bail!(
+                        "[UDP] 已达到最大 socket 数量限制 ({})，丢弃请求",
+                        MAX_OUTBOUND_SOCKETS
+                    );
+                }
 
-            let new_outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-            let port = new_outbound.local_addr()?.port();
-            self.outbound_map
-                .insert(outbound_key, (new_outbound.clone(), port, now));
-            (new_outbound, port)
-        };
+                let new_outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+                let port = new_outbound.local_addr()?.port();
+                self.outbound_map
+                    .insert(outbound_key, (new_outbound.clone(), port, now));
+                (new_outbound, port)
+            };
 
         outbound.send_to(data, target_addr).await?;
 
         let client_key = self.make_client_key(target_addr.ip(), target_addr.port(), local_port);
         self.client_map.insert(client_key, (client_addr, now));
-        trace!(
-            "[UDP] 注册客户端映射 {:?} -> {}",
-            client_key,
-            client_addr
-        );
+        trace!("[UDP] 注册客户端映射 {:?} -> {}", client_key, client_addr);
 
-        self.spawn_listener_if_needed(outbound, local_port, outbound_key).await
+        self.spawn_listener_if_needed(outbound, local_port, outbound_key)
+            .await
     }
 
     async fn spawn_listener_if_needed(
@@ -401,11 +399,12 @@ async fn listen_udp_response(
                         continue;
                     }
 
+                    // 两段式：先校验存在性释放锁，await 后再刷新
                     // 校验 outbound_key 仍有效，防止 entry 已过期但 listener 尚未退出的窗口转发
-                    let Some(mut outbound_entry) = outbound_map.get_mut(&outbound_key) else {
+                    if !outbound_map.contains_key(&outbound_key) {
                         trace!("[UDP] outbound 已过期，丢弃响应");
                         continue;
-                    };
+                    }
 
                     // 从 outbound_key 推导 client_addr，O(1)
                     let client_addr = client_addr_from_outbound_key(&outbound_key);
@@ -415,8 +414,10 @@ async fn listen_udp_response(
                         continue;
                     }
 
-                    // 发送成功后刷新 outbound_map
-                    outbound_entry.value_mut().2 = Instant::now();
+                    // 发送成功后重新获取锁刷新 outbound_map
+                    if let Some(mut outbound_entry) = outbound_map.get_mut(&outbound_key) {
+                        outbound_entry.value_mut().2 = Instant::now();
+                    }
                 }
             }
             _ = &mut stop_signal => {
@@ -492,7 +493,10 @@ mod tests {
         let normalized_once = normalize_ip(v4);
         let normalized_twice = normalize_ip(normalized_once);
 
-        assert_eq!(normalized_once, normalized_twice, "normalize_ip 应是幂等操作");
+        assert_eq!(
+            normalized_once, normalized_twice,
+            "normalize_ip 应是幂等操作"
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -532,10 +536,7 @@ mod tests {
     fn test_outbound_key_consistency() {
         // OutboundKey 不含 target_port，同 IP 不同端口应生成相同 key
         let target_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80);
-        let target_v6 = SocketAddr::new(
-            IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped()),
-            80,
-        );
+        let target_v6 = SocketAddr::new(IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped()), 80);
         let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 54321);
 
         let key1: OutboundKey = (
@@ -571,7 +572,10 @@ mod tests {
             client.port(),
         );
 
-        assert_eq!(key1, key2, "同 IP 不同端口应生成相同的 OutboundKey，复用 socket");
+        assert_eq!(
+            key1, key2,
+            "同 IP 不同端口应生成相同的 OutboundKey，复用 socket"
+        );
     }
 
     #[test]
@@ -650,7 +654,9 @@ mod tests {
             normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             12345,
         );
-        manager.outbound_map.insert(key, (outbound, outbound_port, expired_time));
+        manager
+            .outbound_map
+            .insert(key, (outbound, outbound_port, expired_time));
 
         // 插入对应的 client 映射
         let client_key: ClientKey = (
@@ -694,7 +700,9 @@ mod tests {
             normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             12345,
         );
-        manager.outbound_map.insert(key, (outbound, outbound_port, active_time));
+        manager
+            .outbound_map
+            .insert(key, (outbound, outbound_port, active_time));
 
         assert_eq!(manager.outbound_map.len(), 1);
 
@@ -726,7 +734,9 @@ mod tests {
             .spawn_listener_if_needed(outbound.clone(), outbound_port, outbound_key)
             .await
             .unwrap();
-        assert!(manager.active_outbound_listener_ports.contains(&outbound_port));
+        assert!(manager
+            .active_outbound_listener_ports
+            .contains(&outbound_port));
         assert!(manager.task_handles.contains_key(&outbound_port));
 
         let handle_count_before = manager.task_handles.len();
