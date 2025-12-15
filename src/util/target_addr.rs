@@ -10,7 +10,6 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::vec::IntoIter;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::net::lookup_host;
 
 /// SOCKS5 reply code
 #[derive(Error, Debug)]

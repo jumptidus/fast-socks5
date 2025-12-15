@@ -1,10 +1,8 @@
-use crate::new_udp_header;
-use crate::parse_udp_request;
 use crate::read_exact;
 use crate::ready;
 use crate::util::stream::tcp_connect_with_timeout;
 use crate::util::target_addr::{read_address, TargetAddr};
-use crate::util::udp::*;
+use crate::util::udp::run_udp_server;
 use crate::Socks5Command;
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
 use anyhow::Context;
@@ -18,10 +16,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as AsyncContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs as AsyncToSocketAddrs};
 use tokio::task::JoinHandle;
-use tokio::try_join;
 use tokio_stream::Stream;
 
 #[derive(Clone)]
@@ -187,7 +183,7 @@ impl<A: Authentication> Config<A> {
 /// Useful if you don't use any existing TcpListener's streams.
 pub struct Socks5Server<A: Authentication = DenyAuthentication> {
     listener: TcpListener,
-    udp_join_handle: JoinHandle<anyhow::Result<()>>,
+    udp_join_handle: JoinHandle<()>,
     config: Arc<Config<A>>,
 }
 
@@ -203,7 +199,7 @@ impl<A: Authentication + Default> Socks5Server<A> {
 
         match run_udp_server(udp_port, cleanup_interval, timeout).await {
             Ok(udp_join_handle) => {
-                info!("[UDP] UDP server started..");
+                info!("[UDP] UDP 服务启动成功");
                 Ok(Socks5Server {
                     listener,
                     config,
@@ -211,13 +207,10 @@ impl<A: Authentication + Default> Socks5Server<A> {
                 })
             }
             Err(e) => {
-                error!(
-                    "[UDP] Server error: {:?}, attempting restart in 5 seconds",
-                    e
-                );
+                error!("[UDP] UDP 服务启动失败: {:?}", e);
                 Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "UDP server bind error",
+                    io::ErrorKind::AddrInUse,
+                    format!("UDP 服务绑定端口 {} 失败: {}", udp_port, e),
                 ))
             }
         }
@@ -235,15 +228,6 @@ impl<A: Authentication> Drop for Socks5Server<A> {
 }
 
 impl<A: Authentication> Socks5Server<A> {
-    /// Set a custom config
-    // pub fn with_config<T: Authentication>(self, config: Config<T>) -> Socks5Server<T> {
-    //     Socks5Server {
-    //         listener: self.listener,
-    //         config: Arc::new(config),
-    //         udp_join_handle: self.udp_join_handle,
-    //     }
-    // }
-
     /// Can loop on `incoming().next()` to iterate over incoming connections.
     pub fn incoming(&self) -> Incoming<'_, A> {
         Incoming(self, None)
@@ -800,59 +784,6 @@ where
         Ok(res) => info!("transfer closed ({}, {})", res.0, res.1),
         Err(err) => error!("transfer error: {:?}", err),
     };
-
-    Ok(())
-}
-
-async fn handle_udp_request(inbound: &UdpSocket, outbound: &UdpSocket) -> Result<()> {
-    let mut buf = vec![0u8; 0x10000];
-    loop {
-        let (size, client_addr) = inbound.recv_from(&mut buf).await?;
-        debug!("Server recieve udp from {}", client_addr);
-        inbound.connect(client_addr).await?;
-
-        let (frag, target_addr, data) = parse_udp_request(&buf[..size]).await?;
-
-        if frag != 0 {
-            debug!("Discard UDP frag packets sliently.");
-            return Ok(());
-        }
-
-        debug!("Server forward to packet to {}", target_addr);
-        let mut target_addr = target_addr
-            .to_socket_addrs()?
-            .next()
-            .context("unreachable")?;
-
-        target_addr.set_ip(match target_addr.ip() {
-            std::net::IpAddr::V4(v4) => std::net::IpAddr::V6(v4.to_ipv6_mapped()),
-            v6 @ std::net::IpAddr::V6(_) => v6,
-        });
-        outbound.send_to(data, target_addr).await?;
-    }
-}
-
-async fn handle_udp_response(inbound: &UdpSocket, outbound: &UdpSocket) -> Result<()> {
-    let mut buf = vec![0u8; 0x10000];
-    loop {
-        let (size, remote_addr) = outbound.recv_from(&mut buf).await?;
-        debug!("Recieve packet from {}", remote_addr);
-
-        let mut data = new_udp_header(remote_addr)?;
-        data.extend_from_slice(&buf[..size]);
-        inbound.send(&data).await?;
-    }
-}
-
-async fn transfer_udp(inbound: UdpSocket) -> Result<()> {
-    let outbound = UdpSocket::bind("[::]:0").await?;
-
-    let req_fut = handle_udp_request(&inbound, &outbound);
-    let res_fut = handle_udp_response(&inbound, &outbound);
-    match try_join!(req_fut, res_fut) {
-        Ok(_) => {}
-        Err(error) => return Err(error),
-    }
 
     Ok(())
 }
