@@ -1,4 +1,4 @@
-# Repository Guidelines
+# CLAUDE.md
 
 ## 0 · 关于用户与你的角色
 
@@ -13,24 +13,22 @@
 
 ## 1 · 总体推理与规划框架（全局规则）
 
-在进行任何操作前（包括：回复用户、调用工具或给出代码），你必须先在内部完成如下推理与规划。这些推理过程 **只在你内部进行**，不需要显式输出思维步骤，除非我明确要求你展示。
+在进行任何操作前（包括：回复用户、调用工具或给出代码），你必须先在内部完成如下推理与规划。这些推理过程 **只在你内部进行**
+，不需要显式输出思维步骤，除非我明确要求你展示。
 
 ### 1.1 依赖关系与约束优先级
 
 按以下优先级分析当前任务：
 
 1. **规则与约束**
-
     - 最高优先：所有显式给定的规则、策略、硬性约束（例如语言 / 库版本、禁止操作、性能上限等）。
     - 不得为了“省事”而违反这些约束。
 
 2. **操作顺序与可逆性**
-
     - 分析任务的自然依赖顺序，确保某一步不会阻碍后续必要步骤。
     - 即使用户按随机顺序提需求，你也可以在内部重新排序步骤以保证整体任务可完成。
 
 3. **前置条件与缺失信息**
-
     - 判断当前是否已有足够信息推进；
     - 仅当缺失信息会 **显著影响方案选择或正确性** 时，再向用户提问澄清。
 
@@ -163,7 +161,8 @@
 ## 4 · 语言与编码风格
 
 - 解释、讨论、分析、总结：使用 **简体中文**。
-- 所有代码、注释、标识符（变量名、函数名、类型名等）、提交信息，以及 Markdown 代码块内的内容：全部使用 **English**，不得出现中文字符。
+- 所有代码、标识符（变量名、函数名、类型名等，以及 Markdown 代码块内的内容：全部使用 **English**，不得出现中文字符。
+- 所有注释、日志打印、报错信息等使用简体中文。
 - Markdown 文档中：正文说明使用中文，代码块内全部内容使用 English。
 - 命名与格式：
     - Rust：`snake_case`，模块与 crate 命名遵循社区惯例；
@@ -328,18 +327,15 @@
 对于每个用户问题（尤其是 non-trivial 任务），你的回答应尽量包含以下结构：
 
 1. **直接结论**
-
     - 用简洁语言先回答“应该怎么做 / 当前最合理的结论是什么”。
 
 2. **简要推理过程**
-
     - 用条目或短段落说明你是如何得到这个结论的：
         - 关键前提与假设；
         - 判断步骤；
         - 重要权衡（正确性 / 性能 / 可维护性等）。
 
 3. **可选方案或视角**
-
     - 若存在明显替代实现或不同架构选择，简要列出 1–2 个选项及其适用场景：
         - 例如性能 vs 简洁、通用性 vs 专用性等。
 
@@ -363,31 +359,118 @@
     - 可维护性与演进策略。
 - 在没有必要澄清的重要信息缺失时，尽量减少无谓往返和问题式对话，直接给出高质量思考后的结论与实现建议。
 
-## Rules
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-- 请一直使用简体中文交互
-- 修改文档时,请不要删除Rules部分
+## 语言要求
 
-## 项目结构与模块组织
+请一直使用简体中文交互。更新文档时不要更新 Rules，如需新增文档放在 `/docs` 内。
 
-核心源代码位于`src/`，按业务域拆分目录，如`src/user/`、`src/node/`、`src/edge/`，每个域包含模块、控制器、服务及同目录的DTO、实体和测试。TypeScript编译产物输出到`dist/`，文档保存在`docs/`，覆盖率数据在`coverage/`，运行日志在`logs/`。静态上传与测试数据分别放置于`upload/`与`data/`，避免将生成文件提交到版本库。
+## 常用命令
 
-## 构建、测试与开发命令
+```bash
+cargo check                      # 快速类型检查
+cargo run                        # 运行主程序
+cargo build --release            # 编译发布版本
+cargo test                       # 运行所有测试
+cargo test <test_name>           # 运行单个测试
+cargo test --lib                 # 仅运行库测试
+cargo fmt                        # 格式化代码
+cargo clippy -- -D warnings      # Lint 检查
+./deploy.sh                      # 部署到线上环境
+```
 
-开发时使用`yarn start:dev`启动带热重载的Nest应用（会设置`PUB_ENV=DEV`）。`yarn build`将TypeScript编译到`dist/`，`yarn start:prod`基于编译结果在3693端口运行。完整单测执行`yarn test`，实时调试可用`yarn test:watch`，更新覆盖率时运行`yarn test:cov`。提交前请执行`yarn lint`与`yarn format`以保持风格一致。
+### 交叉编译（部署用）
 
-## 编码风格与命名约定
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
 
-项目使用TypeScript ES2017，缩进为制表符（宽度4）。文件名采用kebab-case，例如`user-api-key.service.ts`；类与接口使用PascalCase，变量与函数用camelCase，常量使用UPPER_SNAKE_CASE。依赖ESLint及`@typescript-eslint`规则并结合Prettier格式化，所有依赖通过构造函数注入，服务提供者保持在各自域模块内。
+## 架构概述
 
-## 测试指南
+这是一个 Rust 后台服务，用于辅助 TIS 主系统进行定时任务调度、数据同步与检测。
 
-所有单元测试使用Jest，测试文件紧邻实现并以`*.spec.ts`命名，例如`src/user/user.service.spec.ts`。与MySQL、MongoDB、Redis以及外部HTTP调用相关的逻辑需使用mock保持测试可重复。提交覆盖率报告时执行`yarn test:cov`并确认关键服务与控制器具备有意义的断言。
+### 核心模块
 
-## 提交与合并请求规范
+- **`src/main.rs`** - 入口点，初始化日志、加载环境配置、建立数据库连接、启动 Axum HTTP 服务与 Apalis 调度器
+- **`src/scheduler.rs`** - Apalis cron 调度器，注册所有定时任务并在冷启动时执行一次关键同步任务
+- **`src/config.rs`** - 环境变量加载与数据库连接配置
+- **`src/logging.rs`** - 日志系统初始化，支持日期轮转或大小轮转策略
+- **`src/entities/`** - SeaORM 实体定义（对应 MySQL 数据表），所有实体通过 `prelude` 模块导出
 
-提交信息遵循Conventional Commits格式，如`feat(user): add API key rotation`。PR需说明变更目的、主要实现、测试结论，并关联相关 Issue 或任务。若涉及行为变更，请附上截图或日志摘要。合并请求前请确保`yarn test`与`yarn lint`均通过。
+### 任务模块 (`src/tasks/`)
 
-## 安全与配置提示
+任务按类型分为三个子目录：
 
-通过`@nestjs/config`加载配置，切勿在代码中硬编码凭据或连接串。开发环境默认使用`PUB_ENV=DEV`，发布前请检视环境变量。API监听3693端口，静态文件从`upload/`提供，对外共享示例数据前请确认权限设置。
+**监控类 (`monitors/`)**：线路检测任务
+| 任务 | 说明 |
+|------|------|
+| `monitor_custom_a` | 定制A线路检测 |
+| `monitor_home_a` | 家庭A线路检测 |
+
+**同步类 (`syncs/`)**：数据对账与IP同步任务
+| 任务 | 说明 |
+|------|------|
+| `sync_home_b_ip` | 家庭B实时IP同步 |
+| `sync_home_b_city` | 家庭B城市信息同步 |
+| `sync_custom_b_ip` | 定制B IP同步 |
+| `sync_custom_a_user` | 定制A对账同步 |
+| `sync_custom_b_user` | 定制B对账同步 |
+| `sync_node_user` | 节点对账同步 |
+
+**触发类 (`triggers/`)**：定期重置任务
+| 任务 | 说明 |
+|------|------|
+| `trigger_custom_b_reset` | EdgeCustomLink 更新次数重置 |
+| `trigger_node_game_reset` | NodeGame 切换次数重置（每月1号） |
+
+每个任务模块包含：
+
+- `*Task` 结构体：任务执行器，持有 `DatabaseConnection`
+- `*_CRON_EXPR` 常量：cron 表达式
+- `run_once()` 方法：任务执行逻辑
+
+### Cell 模块 (`src/cell/`)
+
+封装与主控节点的通信能力：
+
+- `service.rs` - 批量操作 API（`CellApiService`），支持 add/delete/edit/offline/search 等操作
+- `transport.rs` - HTTP 请求层（`HostTransport`），处理并发请求与错误
+- `types.rs` - 数据结构与枚举（`CellTarget`、`Protocol` 等）
+- `custom_b.rs` - 定制B网关公共能力封装
+
+### Helpers 模块 (`src/helpers/`)
+
+通用工具函数：
+
+- `checks.rs` - 线路检测相关
+- `convert.rs` - 端口与 control_id 转换、ISP 映射、地区名称标准化
+- `task.rs` - 批量计算、代理客户端构建
+- `formats.rs` - 格式化工具
+
+## 环境配置
+
+配置文件位于 `configs/.env.<env>`，通过 `APP_ENV` 指定环境（默认 `development`）：
+
+- `APP_ENV=production` 加载 `configs/.env.production`
+- 也可用 `APP_ENV_FILE` 指定任意路径
+
+必需的数据库变量：`DB_HOST`、`DB_PORT`、`DB_USERNAME`、`DB_PASSWORD`、`DB_NAME`
+
+可选日志配置：`LOG_ROTATION`（daily/size）、`LOG_MAX_BYTES`、`LOG_MAX_FILES`
+
+## 部署
+
+线上环境：`root@49.235.148.75`，端口 `3003`
+
+```bash
+./deploy.sh                      # 完整部署
+SYNC_CONFIG=false ./deploy.sh    # 仅部署镜像，不同步配置
+```
+
+## 代码风格
+
+- Rust Edition 2024，四空格缩进
+- 函数/变量使用 `snake_case`，类型使用 `UpperCamelCase`
+- 提交前运行 `cargo fmt` 和 `cargo clippy -- -D warnings`
+- 提交信息使用 Conventional Commits 格式（如 `feat: add cli parser`）
