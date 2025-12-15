@@ -187,10 +187,15 @@ impl UdpManager {
             client_addr
         );
 
-        self.spawn_listener_if_needed(outbound, local_port).await
+        self.spawn_listener_if_needed(outbound, local_port, outbound_key).await
     }
 
-    async fn spawn_listener_if_needed(&self, outbound: Arc<UdpSocket>, port: u16) -> Result<()> {
+    async fn spawn_listener_if_needed(
+        &self,
+        outbound: Arc<UdpSocket>,
+        port: u16,
+        outbound_key: OutboundKey,
+    ) -> Result<()> {
         // 使用 insert 返回值避免 TOCTOU 竞态
         if self.active_outbound_listener_ports.insert(port) {
             trace!("[UDP] 启动端口 {} 的响应监听器", port);
@@ -208,6 +213,7 @@ impl UdpManager {
                 outbound_map,
                 active_ports,
                 port,
+                outbound_key,
                 rx,
             ));
             self.task_handles.insert(port, (handle, tx));
@@ -315,6 +321,7 @@ async fn listen_udp_response(
     outbound_map: Arc<DashMap<OutboundKey, OutboundEntry>>,
     active_ports: Arc<DashSet<u16>>,
     port: u16,
+    outbound_key: OutboundKey,
     mut stop_signal: oneshot::Receiver<()>,
 ) {
     debug!("[UDP] 端口 {} 响应监听器已启动", port);
@@ -358,13 +365,9 @@ async fn listen_udp_response(
                     let now = Instant::now();
                     *last_used = now;
 
-                    // 同时刷新 outbound_map 中对应条目的 last_used，避免只收响应时被提前清理
-                    for mut item in outbound_map.iter_mut() {
-                        let (_, stored_port, ref mut outbound_last_used) = item.value_mut();
-                        if *stored_port == port {
-                            *outbound_last_used = now;
-                            break;
-                        }
+                    // 使用 outbound_key 直接 get_mut，O(1) 更新，避免遍历
+                    if let Some(mut outbound_entry) = outbound_map.get_mut(&outbound_key) {
+                        outbound_entry.value_mut().2 = now;
                     }
                 } else {
                     trace!("[UDP] 未找到客户端映射: {:?}", client_key);
@@ -594,9 +597,16 @@ mod tests {
         let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
         let outbound_port = outbound.local_addr().unwrap().port();
 
+        let outbound_key: OutboundKey = (
+            normalize_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            53,
+            normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            12345,
+        );
+
         // 第一次调用应创建监听器
         manager
-            .spawn_listener_if_needed(outbound.clone(), outbound_port)
+            .spawn_listener_if_needed(outbound.clone(), outbound_port, outbound_key)
             .await
             .unwrap();
         assert!(manager.active_outbound_listener_ports.contains(&outbound_port));
@@ -606,7 +616,7 @@ mod tests {
 
         // 第二次调用应为幂等操作
         manager
-            .spawn_listener_if_needed(outbound.clone(), outbound_port)
+            .spawn_listener_if_needed(outbound.clone(), outbound_port, outbound_key)
             .await
             .unwrap();
 

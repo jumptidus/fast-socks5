@@ -209,8 +209,8 @@ impl<A: Authentication + Default> Socks5Server<A> {
             Err(e) => {
                 error!("[UDP] UDP 服务启动失败: {:?}", e);
                 Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("UDP 服务绑定端口 {} 失败: {}", udp_port, e),
+                    io::ErrorKind::Other,
+                    format!("UDP 服务启动失败: {}", e),
                 ))
             }
         }
