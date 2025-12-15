@@ -24,15 +24,17 @@ const MAX_OUTBOUND_SOCKETS: usize = 1024;
 // 类型定义
 // ============================================================================
 
-/// Outbound 连接的唯一标识: (target_ip, target_port, client_ip, client_port)
-/// 注意: 当前模型为每个 (target, client) 组合创建独立 socket
-type OutboundKey = (IpAddr, u16, IpAddr, u16);
-
-/// Client 映射的唯一标识: (target_ip, local_port)
+/// Outbound 连接的唯一标识: (target_ip, client_ip, client_port)
 ///
-/// 约束说明: 忽略 target_port 是因为当前模型下每个 outbound socket 只对应一个 target，
-/// 通过 local_port 即可唯一确定 outbound。若将来复用 socket（同 IP 多端口），需重新设计此 key。
-type ClientKey = (IpAddr, u16);
+/// 设计说明: 不含 target_port，同一 client 访问同一 target IP 的不同端口复用同一 socket。
+/// 例如 client 同时访问 8.8.8.8:53 和 8.8.8.8:443 会共享一个 outbound socket。
+type OutboundKey = (IpAddr, IpAddr, u16);
+
+/// Client 映射的唯一标识: (target_ip, target_port, local_port)
+///
+/// 设计说明: 包含 target_port 以区分同一 socket 上不同目标端口的响应。
+/// 响应包的 source port 即为 target_port，结合 local_port 可唯一确定 client。
+type ClientKey = (IpAddr, u16, u16);
 
 // ============================================================================
 // 工具函数
@@ -137,15 +139,15 @@ impl UdpManager {
     fn make_outbound_key(&self, target_addr: &SocketAddr, client_addr: &SocketAddr) -> OutboundKey {
         (
             target_addr.ip(), // 已经过 normalize
-            target_addr.port(),
             normalize_ip(client_addr.ip()),
             client_addr.port(),
         )
+        // 不含 target_port，同 IP 多端口复用 socket
     }
 
     #[inline]
-    fn make_client_key(&self, remote_ip: IpAddr, local_port: u16) -> ClientKey {
-        (normalize_ip(remote_ip), local_port)
+    fn make_client_key(&self, target_ip: IpAddr, target_port: u16, local_port: u16) -> ClientKey {
+        (normalize_ip(target_ip), target_port, local_port)
     }
 
     async fn process_outbound(
@@ -179,7 +181,7 @@ impl UdpManager {
 
         outbound.send_to(data, target_addr).await?;
 
-        let client_key = self.make_client_key(target_addr.ip(), local_port);
+        let client_key = self.make_client_key(target_addr.ip(), target_addr.port(), local_port);
         self.client_map.insert(client_key, (client_addr, now));
         trace!(
             "[UDP] 注册客户端映射 {:?} -> {}",
@@ -314,6 +316,16 @@ async fn handle_recv_result(
     state.handle_inbound_packet(buf, size, client_addr).await
 }
 
+/// 从 OutboundKey 推导 client_addr
+///
+/// OutboundKey = (target_ip, client_ip, client_port)
+/// 因此可以直接构造 client_addr = (client_ip, client_port)
+#[inline]
+fn client_addr_from_outbound_key(outbound_key: &OutboundKey) -> SocketAddr {
+    SocketAddr::new(outbound_key.1, outbound_key.2)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn listen_udp_response(
     inbound: Arc<UdpSocket>,
     outbound: Arc<UdpSocket>,
@@ -354,23 +366,57 @@ async fn listen_udp_response(
                 };
 
                 // 使用规范化的 key 查找客户端
-                let client_key = (normalize_ip(remote_addr.ip()), port);
+                // remote_addr.port() = target_port（响应的 source port 即原始目标端口）
+                let remote_ip = normalize_ip(remote_addr.ip());
+                let client_key: ClientKey = (remote_ip, remote_addr.port(), port);
 
-                if let Some(mut entry) = client_map.get_mut(&client_key) {
-                    let (client_addr, ref mut last_used) = entry.value_mut();
-                    if let Err(e) = inbound.send_to(&data, *client_addr).await {
+                // 优先精确匹配 client_map（保留端口级过滤）
+                // 两段式：先取 client_addr 释放锁，await 后再刷新，避免跨 await 持锁
+                let matched_client = client_map.get(&client_key).map(|e| e.value().0);
+
+                if let Some(client_addr) = matched_client {
+                    if let Err(e) = inbound.send_to(&data, client_addr).await {
                         warn!("[UDP] 发送响应到 {} 失败: {:?}", client_addr, e);
                         continue;
                     }
-                    let now = Instant::now();
-                    *last_used = now;
 
-                    // 使用 outbound_key 直接 get_mut，O(1) 更新，避免遍历
+                    // 发送成功后重新获取锁刷新 last_used
+                    let now = Instant::now();
+                    if let Some(mut entry) = client_map.get_mut(&client_key) {
+                        entry.value_mut().1 = now;
+                    }
                     if let Some(mut outbound_entry) = outbound_map.get_mut(&outbound_key) {
                         outbound_entry.value_mut().2 = now;
                     }
                 } else {
-                    trace!("[UDP] 未找到客户端映射: {:?}", client_key);
+                    // 降级路径：精确匹配失败，校验 IP 后转发
+                    // 场景：某些服务端从不同 source port 回包（NAT、负载均衡等）
+                    let expected_target_ip = outbound_key.0;
+                    if remote_ip != expected_target_ip {
+                        trace!(
+                            "[UDP] 响应 IP 不匹配: 收到 {}, 期望 {}",
+                            remote_ip,
+                            expected_target_ip
+                        );
+                        continue;
+                    }
+
+                    // 校验 outbound_key 仍有效，防止 entry 已过期但 listener 尚未退出的窗口转发
+                    let Some(mut outbound_entry) = outbound_map.get_mut(&outbound_key) else {
+                        trace!("[UDP] outbound 已过期，丢弃响应");
+                        continue;
+                    };
+
+                    // 从 outbound_key 推导 client_addr，O(1)
+                    let client_addr = client_addr_from_outbound_key(&outbound_key);
+
+                    if let Err(e) = inbound.send_to(&data, client_addr).await {
+                        warn!("[UDP] 发送响应到 {} 失败: {:?}", client_addr, e);
+                        continue;
+                    }
+
+                    // 发送成功后刷新 outbound_map
+                    outbound_entry.value_mut().2 = Instant::now();
                 }
             }
             _ = &mut stop_signal => {
@@ -458,17 +504,33 @@ mod tests {
         // 验证 IPv4 和其对应的 IPv6 映射地址生成相同的 ClientKey（都转为 IPv4）
         let ipv4 = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         let ipv6_mapped = IpAddr::V6(Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped());
-        let port = 12345u16;
+        let target_port = 53u16;
+        let local_port = 12345u16;
 
-        let key1: ClientKey = (normalize_ip(ipv4), port);
-        let key2: ClientKey = (normalize_ip(ipv6_mapped), port);
+        let key1: ClientKey = (normalize_ip(ipv4), target_port, local_port);
+        let key2: ClientKey = (normalize_ip(ipv6_mapped), target_port, local_port);
 
         assert_eq!(key1, key2, "IPv4 和 IPv6 映射地址应生成相同的 ClientKey");
         assert_eq!(key1.0, ipv4, "规范化后应为 IPv4");
     }
 
     #[test]
+    fn test_client_key_distinguishes_target_ports() {
+        // 不同 target_port 应生成不同的 ClientKey
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let local_port = 54321u16;
+
+        let key_dns: ClientKey = (normalize_ip(ip), 53, local_port);
+        let key_https: ClientKey = (normalize_ip(ip), 443, local_port);
+
+        assert_ne!(key_dns, key_https, "不同 target_port 应有不同 ClientKey");
+        assert_eq!(key_dns.0, key_https.0, "同一 target_ip");
+        assert_eq!(key_dns.2, key_https.2, "同一 local_port");
+    }
+
+    #[test]
     fn test_outbound_key_consistency() {
+        // OutboundKey 不含 target_port，同 IP 不同端口应生成相同 key
         let target_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80);
         let target_v6 = SocketAddr::new(
             IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped()),
@@ -478,19 +540,76 @@ mod tests {
 
         let key1: OutboundKey = (
             normalize_ip(target_v4.ip()),
-            target_v4.port(),
             normalize_ip(client.ip()),
             client.port(),
         );
         let key2: OutboundKey = (
             normalize_ip(target_v6.ip()),
-            target_v6.port(),
             normalize_ip(client.ip()),
             client.port(),
         );
 
         assert_eq!(key1, key2, "IPv4 和 IPv6 映射地址应生成相同的 OutboundKey");
         assert_eq!(key1.0, target_v4.ip(), "规范化后目标地址应为 IPv4");
+    }
+
+    #[test]
+    fn test_socket_reuse_same_ip_different_ports() {
+        // 同一 client 访问同一 IP 的不同端口应复用 socket（生成相同 OutboundKey）
+        let target_dns = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        let target_https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443);
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+
+        let key1: OutboundKey = (
+            normalize_ip(target_dns.ip()),
+            normalize_ip(client.ip()),
+            client.port(),
+        );
+        let key2: OutboundKey = (
+            normalize_ip(target_https.ip()),
+            normalize_ip(client.ip()),
+            client.port(),
+        );
+
+        assert_eq!(key1, key2, "同 IP 不同端口应生成相同的 OutboundKey，复用 socket");
+    }
+
+    #[test]
+    fn test_client_addr_from_outbound_key() {
+        // 验证从 OutboundKey 推导 client_addr
+        let target_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let client_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        let client_port = 12345u16;
+
+        let outbound_key: OutboundKey = (target_ip, client_ip, client_port);
+        let client_addr = client_addr_from_outbound_key(&outbound_key);
+
+        assert_eq!(client_addr.ip(), client_ip);
+        assert_eq!(client_addr.port(), client_port);
+    }
+
+    #[test]
+    fn test_outbound_key_contains_client_info() {
+        // 验证 OutboundKey 设计：包含 client_ip 和 client_port
+        // 这使得响应处理可以 O(1) 推导 client_addr，无需遍历 client_map
+        let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 54321);
+
+        let outbound_key: OutboundKey = (
+            normalize_ip(target.ip()),
+            normalize_ip(client.ip()),
+            client.port(),
+        );
+
+        // 从 outbound_key 可以：
+        // 1. 验证 remote_ip 是否匹配 target_ip (outbound_key.0)
+        // 2. 推导 client_addr (outbound_key.1, outbound_key.2)
+        assert_eq!(outbound_key.0, target.ip(), "target_ip 在 key.0");
+        assert_eq!(outbound_key.1, client.ip(), "client_ip 在 key.1");
+        assert_eq!(outbound_key.2, client.port(), "client_port 在 key.2");
+
+        let derived_client = client_addr_from_outbound_key(&outbound_key);
+        assert_eq!(derived_client, client, "应能正确推导 client_addr");
     }
 
     // ------------------------------------------------------------------------
@@ -528,7 +647,6 @@ mod tests {
 
         let key: OutboundKey = (
             normalize_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-            53,
             normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             12345,
         );
@@ -537,6 +655,7 @@ mod tests {
         // 插入对应的 client 映射
         let client_key: ClientKey = (
             normalize_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            53, // target_port
             outbound_port,
         );
         manager.client_map.insert(
@@ -572,7 +691,6 @@ mod tests {
 
         let key: OutboundKey = (
             normalize_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-            53,
             normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             12345,
         );
@@ -599,7 +717,6 @@ mod tests {
 
         let outbound_key: OutboundKey = (
             normalize_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-            53,
             normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             12345,
         );
