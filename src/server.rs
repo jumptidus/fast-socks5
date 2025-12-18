@@ -232,6 +232,19 @@ impl<A: Authentication> Socks5Server<A> {
     pub fn incoming(&self) -> Incoming<'_, A> {
         Incoming(self, None)
     }
+
+    /// Accept one incoming TCP connection and wrap it into [`Socks5Socket`].
+    pub async fn accept(&self) -> Result<Socks5Socket<TcpStream, A>> {
+        let (socket, peer_addr) = self.listener.accept().await?;
+
+        let local_addr = socket.local_addr()?;
+        debug!(
+            "incoming connection from peer {} @ {}",
+            &peer_addr, &local_addr
+        );
+
+        Ok(Socks5Socket::new(socket, self.config.clone()))
+    }
 }
 
 /// `Incoming` implements [`futures_core::stream::Stream`].
@@ -886,7 +899,7 @@ mod tests {
         let accept_error = async move {
             Err::<(TcpStream, SocketAddr), io::Error>(io::Error::new(
                 io::ErrorKind::Other,
-                "accept error",
+                "accept 错误",
             ))
         };
 
@@ -899,5 +912,35 @@ mod tests {
         let second =
             tokio::time::timeout(Duration::from_millis(10), incoming.next()).await;
         assert!(second.is_err());
+    }
+
+    #[tokio::test]
+    async fn incoming_next_cancelled_by_select_does_not_panic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let udp_join_handle = tokio::spawn(async move {});
+
+        let server = Socks5Server {
+            listener,
+            udp_join_handle,
+            config: Arc::new(Config::<DenyAuthentication>::default()),
+        };
+
+        let mut incoming = server.incoming();
+
+        tokio::select! {
+            biased;
+            _ = incoming.next() => {
+                panic!("未预期的连接被接受");
+            }
+            _ = async {} => {}
+        }
+
+        let _client = TcpStream::connect(listen_addr).await.unwrap();
+
+        let accepted = tokio::time::timeout(Duration::from_secs(1), incoming.next())
+            .await
+            .unwrap();
+        assert!(matches!(accepted, Some(Ok(_))));
     }
 }
