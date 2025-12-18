@@ -258,8 +258,9 @@ impl<'a, A: Authentication> Stream for Incoming<'a, A> {
 
             if let Some(f) = &mut self.1 {
                 // early returns if pending
-                let (socket, peer_addr) = ready!(f.as_mut().poll(cx))?;
+                let accept_result = ready!(f.as_mut().poll(cx));
                 self.1 = None;
+                let (socket, peer_addr) = accept_result?;
 
                 let local_addr = socket.local_addr()?;
                 debug!(
@@ -860,4 +861,43 @@ fn new_reply(error: &ReplyError, sock_addr: SocketAddr) -> Vec<u8> {
     reply.append(&mut port);
 
     reply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn incoming_accept_error_does_not_panic_on_next_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udp_join_handle = tokio::spawn(async move {});
+
+        let server = Socks5Server {
+            listener,
+            udp_join_handle,
+            config: Arc::new(Config::<DenyAuthentication>::default()),
+        };
+
+        // 通过注入一个立即失败的 accept future，覆盖 `poll_next` 的错误分支。
+        // 若 accept future 在返回 Ready 后未被清理，下一次 poll 会触发
+        // `async fn resumed after completion` 的 panic。
+        let accept_error = async move {
+            Err::<(TcpStream, SocketAddr), io::Error>(io::Error::new(
+                io::ErrorKind::Other,
+                "accept error",
+            ))
+        };
+
+        let mut incoming = Incoming(&server, Some(Box::pin(accept_error)));
+
+        let first = incoming.next().await;
+        assert!(matches!(first, Some(Err(_))));
+
+        // 没有真实连接时，下一次 `next()` 应该进入 accept pending，而不是 panic。
+        let second =
+            tokio::time::timeout(Duration::from_millis(10), incoming.next()).await;
+        assert!(second.is_err());
+    }
 }
