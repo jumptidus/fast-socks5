@@ -18,7 +18,7 @@ use super::target_addr::TargetAddr;
 const UDP_BUFFER_SIZE: usize = 0x10000; // 64KB
 
 /// 全局最大 outbound socket 数量，防止资源耗尽
-const MAX_OUTBOUND_SOCKETS: usize = 512;
+const MAX_OUTBOUND_SOCKETS: usize = 128;
 
 // ============================================================================
 // 类型定义
