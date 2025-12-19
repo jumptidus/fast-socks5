@@ -473,7 +473,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
             method_supported
         );
         self.inner
-            .write(&[consts::SOCKS5_VERSION, method_supported])
+            .write_all(&[consts::SOCKS5_VERSION, method_supported])
             .await
             .context("Can't reply with method auth-none")?;
         Ok(method_supported)
@@ -583,7 +583,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
         debug!("reply error to be written: {:?}", &reply);
 
         self.inner
-            .write(&reply)
+            .write_all(&reply)
             .await
             .context("Can't write the reply!")?;
 
@@ -712,7 +712,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
         debug!("Connected to remote destination");
 
         self.inner
-            .write(&new_reply(
+            .write_all(&new_reply(
                 &ReplyError::Succeeded,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
             ))
@@ -744,7 +744,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
         // Respect the pre-populated reply IP address.
         self.inner
-            .write(&new_reply(
+            .write_all(&new_reply(
                 &ReplyError::Succeeded,
                 SocketAddr::new(
                     self.reply_ip.context("invalid reply ip")?,
@@ -909,8 +909,7 @@ mod tests {
         assert!(matches!(first, Some(Err(_))));
 
         // 没有真实连接时，下一次 `next()` 应该进入 accept pending，而不是 panic。
-        let second =
-            tokio::time::timeout(Duration::from_millis(10), incoming.next()).await;
+        let second = tokio::time::timeout(Duration::from_millis(10), incoming.next()).await;
         assert!(second.is_err());
     }
 

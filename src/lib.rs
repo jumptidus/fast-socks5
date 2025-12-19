@@ -401,7 +401,7 @@ mod test {
 
     #[test]
     fn test_server() {
-        let (tx, rx) = oneshot::channel();
+        let (tx, _) = oneshot::channel();
         tokio::spawn(setup_socks_server("127.0.0.1:10800", None, tx));
     }
 
