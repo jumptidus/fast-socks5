@@ -195,7 +195,7 @@ impl<A: Authentication + Default> Socks5Server<A> {
         timeout: u64,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(&addr).await?;
-        let config = Arc::new(Config::default());
+        let config = Arc::new(Config::<A>::default());
 
         match run_udp_server(udp_port, cleanup_interval, timeout).await {
             Ok(udp_join_handle) => {
@@ -879,8 +879,59 @@ fn new_reply(error: &ReplyError, sock_addr: SocketAddr) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
     use std::time::Duration;
+    use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
     use tokio_stream::StreamExt;
+
+    struct PartialWriteStream<T> {
+        inner: T,
+        max_write: usize,
+    }
+
+    impl<T> PartialWriteStream<T> {
+        fn new(inner: T, max_write: usize) -> Self {
+            assert!(max_write > 0, "max_write 必须大于 0");
+            Self { inner, max_write }
+        }
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for PartialWriteStream<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for PartialWriteStream<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let limit = self.max_write.min(buf.len());
+            Pin::new(&mut self.inner).poll_write(cx, &buf[..limit])
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     #[tokio::test]
     async fn incoming_accept_error_does_not_panic_on_next_poll() {
@@ -941,5 +992,60 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(accepted, Some(Ok(_))));
+    }
+
+    #[tokio::test]
+    async fn can_accept_method_writes_full_reply_on_partial_write() {
+        let (mut client, server) = tokio::io::duplex(8);
+        let server = PartialWriteStream::new(server, 1);
+        let config = Arc::new(Config::<DenyAuthentication>::default());
+        let mut socket = Socks5Socket::new(server, config);
+
+        let method = socket
+            .can_accept_method(vec![consts::SOCKS5_AUTH_METHOD_NONE])
+            .await
+            .unwrap();
+        assert_eq!(method, consts::SOCKS5_AUTH_METHOD_NONE);
+
+        let mut buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_millis(100), client.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            buf,
+            [consts::SOCKS5_VERSION, consts::SOCKS5_AUTH_METHOD_NONE]
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_error_writes_full_reply_on_partial_write() {
+        let (mut client, server) = tokio::io::duplex(16);
+        let server = PartialWriteStream::new(server, 1);
+        let config = Arc::new(Config::<DenyAuthentication>::default());
+        let mut socket = Socks5Socket::new(server, config);
+
+        socket.reply_error(&ReplyError::GeneralFailure).await.unwrap();
+
+        let mut buf = [0u8; 10];
+        tokio::time::timeout(Duration::from_millis(100), client.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            buf,
+            [
+                consts::SOCKS5_VERSION,
+                ReplyError::GeneralFailure.as_u8(),
+                0x00,
+                consts::SOCKS5_ADDR_TYPE_IPV4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
     }
 }
