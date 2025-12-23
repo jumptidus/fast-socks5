@@ -3,6 +3,7 @@ use crate::ready;
 use crate::util::stream::tcp_connect_with_timeout;
 use crate::util::target_addr::{read_address, TargetAddr};
 use crate::util::udp::run_udp_server;
+pub use crate::util::udp::DEFAULT_MAX_OUTBOUND_SOCKETS;
 use crate::Socks5Command;
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
 use anyhow::Context;
@@ -193,11 +194,12 @@ impl<A: Authentication + Default> Socks5Server<A> {
         udp_port: u16,
         cleanup_interval: u64,
         timeout: u64,
+        max_outbound_sockets: usize,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(&addr).await?;
         let config = Arc::new(Config::<A>::default());
 
-        match run_udp_server(udp_port, cleanup_interval, timeout).await {
+        match run_udp_server(udp_port, cleanup_interval, timeout, max_outbound_sockets).await {
             Ok(udp_join_handle) => {
                 info!("[UDP] UDP 服务启动成功");
                 Ok(Socks5Server {
@@ -918,17 +920,11 @@ mod tests {
             Pin::new(&mut self.inner).poll_write(cx, &buf[..limit])
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.inner).poll_shutdown(cx)
         }
     }
@@ -1025,7 +1021,10 @@ mod tests {
         let config = Arc::new(Config::<DenyAuthentication>::default());
         let mut socket = Socks5Socket::new(server, config);
 
-        socket.reply_error(&ReplyError::GeneralFailure).await.unwrap();
+        socket
+            .reply_error(&ReplyError::GeneralFailure)
+            .await
+            .unwrap();
 
         let mut buf = [0u8; 10];
         tokio::time::timeout(Duration::from_millis(100), client.read_exact(&mut buf))

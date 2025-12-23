@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fast_socks5::client::{Config as ClientConfig, Socks5Datagram, Socks5Stream};
-use fast_socks5::server::{AcceptAuthentication, Config, Socks5Server};
+use fast_socks5::server::{
+    AcceptAuthentication, Config, Socks5Server, DEFAULT_MAX_OUTBOUND_SOCKETS,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
@@ -119,8 +121,11 @@ impl TestSocksServer {
         let addr = format!("127.0.0.1:{}", port);
 
         let mut socks5_server = match <Socks5Server<AcceptAuthentication>>::bind(
-            &addr, udp_port, 5,  // cleanup_interval
+            &addr,
+            udp_port,
+            5,  // cleanup_interval
             30, // timeout
+            DEFAULT_MAX_OUTBOUND_SOCKETS,
         )
         .await
         {

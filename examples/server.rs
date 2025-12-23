@@ -17,6 +17,9 @@ struct Args {
 
     #[structopt(long, default_value = "30")]
     udp_timeout: u64,
+
+    #[structopt(long, default_value = "128")]
+    udp_max_outbound_sockets: usize,
 }
 
 #[tokio::main]
@@ -31,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
         args.udp_port,
         args.udp_cleanup_interval,
         args.udp_timeout,
+        args.udp_max_outbound_sockets,
     )
     .await?;
 
@@ -52,4 +56,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-

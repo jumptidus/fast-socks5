@@ -17,8 +17,8 @@ use super::target_addr::TargetAddr;
 
 const UDP_BUFFER_SIZE: usize = 0x10000; // 64KB
 
-/// 全局最大 outbound socket 数量，防止资源耗尽
-const MAX_OUTBOUND_SOCKETS: usize = 128;
+/// 默认的最大 outbound socket 数量，防止资源耗尽
+pub const DEFAULT_MAX_OUTBOUND_SOCKETS: usize = 128;
 
 // ============================================================================
 // 类型定义
@@ -68,10 +68,11 @@ struct UdpManager {
     client_map: Arc<DashMap<ClientKey, (SocketAddr, Instant)>>,
     active_outbound_listener_ports: Arc<DashSet<u16>>,
     task_handles: DashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>,
+    max_outbound_sockets: usize,
 }
 
 impl UdpManager {
-    async fn new(udp_port: u16) -> Result<Self> {
+    async fn new(udp_port: u16, max_outbound_sockets: usize) -> Result<Self> {
         let udp_addr = format!("127.0.0.1:{}", udp_port);
         let udp_socket = UdpSocket::bind(&udp_addr)
             .await
@@ -85,6 +86,7 @@ impl UdpManager {
             client_map: Arc::new(DashMap::new()),
             active_outbound_listener_ports: Arc::new(DashSet::new()),
             task_handles: DashMap::new(),
+            max_outbound_sockets,
         })
     }
 
@@ -166,10 +168,10 @@ impl UdpManager {
                 (entry.value().0.clone(), entry.value().1)
             } else {
                 // 检查资源上限
-                if self.outbound_map.len() >= MAX_OUTBOUND_SOCKETS {
+                if self.outbound_map.len() >= self.max_outbound_sockets {
                     anyhow::bail!(
                         "[UDP] 已达到最大 socket 数量限制 ({})，丢弃请求",
-                        MAX_OUTBOUND_SOCKETS
+                        self.max_outbound_sockets
                     );
                 }
 
@@ -271,8 +273,9 @@ pub async fn run_udp_server(
     udp_port: u16,
     cleanup_interval: u64,
     timeout: u64,
+    max_outbound_sockets: usize,
 ) -> Result<JoinHandle<()>> {
-    let udp_manager = UdpManager::new(udp_port).await?;
+    let udp_manager = UdpManager::new(udp_port, max_outbound_sockets).await?;
 
     let handle = tokio::spawn(async move {
         let cleanup_interval = Duration::from_secs(cleanup_interval);
@@ -627,7 +630,7 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port).await;
+        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS).await;
         assert!(manager.is_ok(), "UdpManager 应成功创建");
 
         let manager = manager.unwrap();
@@ -642,7 +645,9 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port).await.unwrap();
+        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS)
+            .await
+            .unwrap();
 
         // 插入一个过期的 outbound
         let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -688,7 +693,9 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port).await.unwrap();
+        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS)
+            .await
+            .unwrap();
 
         // 插入一个活跃的 outbound
         let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -718,7 +725,9 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port).await.unwrap();
+        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS)
+            .await
+            .unwrap();
 
         let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
         let outbound_port = outbound.local_addr().unwrap().port();
