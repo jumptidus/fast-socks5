@@ -2,7 +2,7 @@ use crate::read_exact;
 use crate::ready;
 use crate::util::stream::tcp_connect_with_timeout;
 use crate::util::target_addr::{read_address, TargetAddr};
-use crate::util::udp::run_udp_server;
+use crate::util::udp::{run_udp_server_with_burst, BurstLimiter};
 pub use crate::util::udp::DEFAULT_MAX_OUTBOUND_SOCKETS;
 use crate::Socks5Command;
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
@@ -14,7 +14,7 @@ use std::net::Ipv4Addr;
 use std::net::{SocketAddr, ToSocketAddrs as StdToSocketAddrs};
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 use std::task::{Context as AsyncContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs as AsyncToSocketAddrs};
@@ -194,12 +194,39 @@ impl<A: Authentication + Default> Socks5Server<A> {
         udp_port: u16,
         cleanup_interval: u64,
         timeout: u64,
-        max_outbound_sockets: usize,
+        max_outbound_sockets: Arc<AtomicUsize>,
+    ) -> io::Result<Self> {
+        Self::bind_with_burst(
+            addr,
+            udp_port,
+            cleanup_interval,
+            timeout,
+            max_outbound_sockets,
+            None,
+        )
+        .await
+    }
+
+    pub async fn bind_with_burst<S: AsyncToSocketAddrs>(
+        addr: S,
+        udp_port: u16,
+        cleanup_interval: u64,
+        timeout: u64,
+        max_outbound_sockets: Arc<AtomicUsize>,
+        burst_limiter: Option<Arc<BurstLimiter>>,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(&addr).await?;
         let config = Arc::new(Config::<A>::default());
 
-        match run_udp_server(udp_port, cleanup_interval, timeout, max_outbound_sockets).await {
+        match run_udp_server_with_burst(
+            udp_port,
+            cleanup_interval,
+            timeout,
+            max_outbound_sockets,
+            burst_limiter,
+        )
+        .await
+        {
             Ok(udp_join_handle) => {
                 info!("[UDP] UDP 服务启动成功");
                 Ok(Socks5Server {

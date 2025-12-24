@@ -6,7 +6,8 @@
 //! - 端口分配与超时保护
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -125,7 +126,7 @@ impl TestSocksServer {
             udp_port,
             5,  // cleanup_interval
             30, // timeout
-            DEFAULT_MAX_OUTBOUND_SOCKETS,
+            Arc::new(AtomicUsize::new(DEFAULT_MAX_OUTBOUND_SOCKETS)),
         )
         .await
         {

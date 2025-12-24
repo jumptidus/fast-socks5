@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use dashmap::{DashMap, DashSet};
 use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, sync::oneshot, task::JoinHandle};
@@ -21,6 +24,62 @@ const UDP_BUFFER_SIZE: usize = 0x10000; // 64KB
 pub const DEFAULT_MAX_OUTBOUND_SOCKETS: usize = 128;
 
 // ============================================================================
+// 突发限流
+// ============================================================================
+
+pub struct BurstLimiter {
+    limit: AtomicUsize,
+    in_use: AtomicUsize,
+}
+
+pub struct BurstPermit {
+    limiter: Arc<BurstLimiter>,
+}
+
+impl Drop for BurstPermit {
+    fn drop(&mut self) {
+        self.limiter.in_use.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl BurstLimiter {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(limit),
+            in_use: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    pub fn update_limit(&self, limit: usize) -> bool {
+        self.limit.swap(limit, Ordering::Relaxed) != limit
+    }
+
+    pub fn try_acquire(self: &Arc<Self>) -> Option<BurstPermit> {
+        loop {
+            let limit = self.limit.load(Ordering::Acquire);
+            let current = self.in_use.load(Ordering::Acquire);
+            if current >= limit {
+                return None;
+            }
+
+            if self
+                .in_use
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(BurstPermit {
+                    limiter: Arc::clone(self),
+                });
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 类型定义
 // ============================================================================
 
@@ -35,6 +94,15 @@ type OutboundKey = (IpAddr, IpAddr, u16);
 /// 设计说明: 包含 target_port 以区分同一 socket 上不同目标端口的响应。
 /// 响应包的 source port 即为 target_port，结合 local_port 可唯一确定 client。
 type ClientKey = (IpAddr, u16, u16);
+
+struct OutboundEntry {
+    socket: Arc<UdpSocket>,
+    local_port: u16,
+    last_used: Instant,
+    #[allow(dead_code)]
+    // 持有突发令牌以控制生命周期
+    burst_permit: Option<BurstPermit>,
+}
 
 // ============================================================================
 // 工具函数
@@ -57,22 +125,23 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 // UdpManager
 // ============================================================================
 
-/// Outbound 条目：(socket, local_port, last_used)
-/// 将 local_port 存入结构避免依赖 socket.local_addr()
-type OutboundEntry = (Arc<UdpSocket>, u16, Instant);
-
 struct UdpManager {
     inbound: Arc<UdpSocket>,
-    /// key -> (socket, local_port, last_used)
+    /// key -> outbound entry
     outbound_map: Arc<DashMap<OutboundKey, OutboundEntry>>,
     client_map: Arc<DashMap<ClientKey, (SocketAddr, Instant)>>,
     active_outbound_listener_ports: Arc<DashSet<u16>>,
     task_handles: DashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>,
-    max_outbound_sockets: usize,
+    max_outbound_sockets: Arc<AtomicUsize>,
+    burst_limiter: Option<Arc<BurstLimiter>>,
 }
 
 impl UdpManager {
-    async fn new(udp_port: u16, max_outbound_sockets: usize) -> Result<Self> {
+    async fn new(
+        udp_port: u16,
+        max_outbound_sockets: Arc<AtomicUsize>,
+        burst_limiter: Option<Arc<BurstLimiter>>,
+    ) -> Result<Self> {
         let udp_addr = format!("127.0.0.1:{}", udp_port);
         let udp_socket = UdpSocket::bind(&udp_addr)
             .await
@@ -87,6 +156,7 @@ impl UdpManager {
             active_outbound_listener_ports: Arc::new(DashSet::new()),
             task_handles: DashMap::new(),
             max_outbound_sockets,
+            burst_limiter,
         })
     }
 
@@ -163,23 +233,49 @@ impl UdpManager {
 
         let (outbound, local_port) =
             if let Some(mut entry) = self.outbound_map.get_mut(&outbound_key) {
-                // 刷新 last_used (index 2)
-                entry.value_mut().2 = now;
-                (entry.value().0.clone(), entry.value().1)
+                entry.value_mut().last_used = now;
+                (entry.value().socket.clone(), entry.value().local_port)
             } else {
-                // 检查资源上限
-                if self.outbound_map.len() >= self.max_outbound_sockets {
-                    anyhow::bail!(
-                        "[UDP] 已达到最大 socket 数量限制 ({})，丢弃请求",
-                        self.max_outbound_sockets
-                    );
-                }
+                // 检查基础上限，必要时申请全局突发令牌
+                let max_outbound_sockets = self.max_outbound_sockets.load(Ordering::Relaxed);
+                if self.outbound_map.len() >= max_outbound_sockets {
+                    let permit = self
+                        .burst_limiter
+                        .as_ref()
+                        .and_then(|limiter| limiter.try_acquire());
+                    let Some(permit) = permit else {
+                        anyhow::bail!(
+                            "[UDP] 已达到最大 socket 数量限制 ({})，且突发池耗尽，丢弃请求",
+                            max_outbound_sockets
+                        );
+                    };
 
-                let new_outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-                let port = new_outbound.local_addr()?.port();
-                self.outbound_map
-                    .insert(outbound_key, (new_outbound.clone(), port, now));
-                (new_outbound, port)
+                    let new_outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+                    let port = new_outbound.local_addr()?.port();
+                    self.outbound_map.insert(
+                        outbound_key,
+                        OutboundEntry {
+                            socket: new_outbound.clone(),
+                            local_port: port,
+                            last_used: now,
+                            burst_permit: Some(permit),
+                        },
+                    );
+                    (new_outbound, port)
+                } else {
+                    let new_outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+                    let port = new_outbound.local_addr()?.port();
+                    self.outbound_map.insert(
+                        outbound_key,
+                        OutboundEntry {
+                            socket: new_outbound.clone(),
+                            local_port: port,
+                            last_used: now,
+                            burst_permit: None,
+                        },
+                    );
+                    (new_outbound, port)
+                }
             };
 
         outbound.send_to(data, target_addr).await?;
@@ -236,9 +332,9 @@ impl UdpManager {
         // 阶段1: 收集需要清理的端口（使用存储的 port 而非 local_addr()）
         let mut expired_ports: Vec<u16> = Vec::new();
 
-        self.outbound_map.retain(|_, (_socket, port, last_used)| {
-            if now.duration_since(*last_used) > timeout {
-                expired_ports.push(*port);
+        self.outbound_map.retain(|_, entry| {
+            if now.duration_since(entry.last_used) > timeout {
+                expired_ports.push(entry.local_port);
                 false
             } else {
                 true
@@ -269,13 +365,14 @@ impl UdpManager {
 // 公开 API
 // ============================================================================
 
-pub async fn run_udp_server(
+pub async fn run_udp_server_with_burst(
     udp_port: u16,
     cleanup_interval: u64,
     timeout: u64,
-    max_outbound_sockets: usize,
+    max_outbound_sockets: Arc<AtomicUsize>,
+    burst_limiter: Option<Arc<BurstLimiter>>,
 ) -> Result<JoinHandle<()>> {
-    let udp_manager = UdpManager::new(udp_port, max_outbound_sockets).await?;
+    let udp_manager = UdpManager::new(udp_port, max_outbound_sockets, burst_limiter).await?;
 
     let handle = tokio::spawn(async move {
         let cleanup_interval = Duration::from_secs(cleanup_interval);
@@ -301,6 +398,16 @@ pub async fn run_udp_server(
     });
 
     Ok(handle)
+}
+
+pub async fn run_udp_server(
+    udp_port: u16,
+    cleanup_interval: u64,
+    timeout: u64,
+    max_outbound_sockets: Arc<AtomicUsize>,
+) -> Result<JoinHandle<()>> {
+    run_udp_server_with_burst(udp_port, cleanup_interval, timeout, max_outbound_sockets, None)
+        .await
 }
 
 // ============================================================================
@@ -387,7 +494,7 @@ async fn listen_udp_response(
                         entry.value_mut().1 = now;
                     }
                     if let Some(mut outbound_entry) = outbound_map.get_mut(&outbound_key) {
-                        outbound_entry.value_mut().2 = now;
+                        outbound_entry.value_mut().last_used = now;
                     }
                 } else {
                     // 降级路径：精确匹配失败，校验 IP 后转发
@@ -419,7 +526,7 @@ async fn listen_udp_response(
 
                     // 发送成功后重新获取锁刷新 outbound_map
                     if let Some(mut outbound_entry) = outbound_map.get_mut(&outbound_key) {
-                        outbound_entry.value_mut().2 = Instant::now();
+                        outbound_entry.value_mut().last_used = Instant::now();
                     }
                 }
             }
@@ -630,7 +737,12 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS).await;
+        let manager = UdpManager::new(
+            port,
+            Arc::new(AtomicUsize::new(DEFAULT_MAX_OUTBOUND_SOCKETS)),
+            None,
+        )
+        .await;
         assert!(manager.is_ok(), "UdpManager 应成功创建");
 
         let manager = manager.unwrap();
@@ -645,9 +757,13 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS)
-            .await
-            .unwrap();
+        let manager = UdpManager::new(
+            port,
+            Arc::new(AtomicUsize::new(DEFAULT_MAX_OUTBOUND_SOCKETS)),
+            None,
+        )
+        .await
+        .unwrap();
 
         // 插入一个过期的 outbound
         let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -659,9 +775,15 @@ mod tests {
             normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             12345,
         );
-        manager
-            .outbound_map
-            .insert(key, (outbound, outbound_port, expired_time));
+        manager.outbound_map.insert(
+            key,
+            OutboundEntry {
+                socket: outbound,
+                local_port: outbound_port,
+                last_used: expired_time,
+                burst_permit: None,
+            },
+        );
 
         // 插入对应的 client 映射
         let client_key: ClientKey = (
@@ -693,9 +815,13 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS)
-            .await
-            .unwrap();
+        let manager = UdpManager::new(
+            port,
+            Arc::new(AtomicUsize::new(DEFAULT_MAX_OUTBOUND_SOCKETS)),
+            None,
+        )
+        .await
+        .unwrap();
 
         // 插入一个活跃的 outbound
         let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -707,9 +833,15 @@ mod tests {
             normalize_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             12345,
         );
-        manager
-            .outbound_map
-            .insert(key, (outbound, outbound_port, active_time));
+        manager.outbound_map.insert(
+            key,
+            OutboundEntry {
+                socket: outbound,
+                local_port: outbound_port,
+                last_used: active_time,
+                burst_permit: None,
+            },
+        );
 
         assert_eq!(manager.outbound_map.len(), 1);
 
@@ -725,9 +857,13 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
 
-        let manager = UdpManager::new(port, DEFAULT_MAX_OUTBOUND_SOCKETS)
-            .await
-            .unwrap();
+        let manager = UdpManager::new(
+            port,
+            Arc::new(AtomicUsize::new(DEFAULT_MAX_OUTBOUND_SOCKETS)),
+            None,
+        )
+        .await
+        .unwrap();
 
         let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
         let outbound_port = outbound.local_addr().unwrap().port();

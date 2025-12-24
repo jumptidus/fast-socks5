@@ -1,6 +1,9 @@
 use fast_socks5::server::{DenyAuthentication, Socks5Server};
 use log::{error, info};
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{atomic::AtomicUsize, Arc},
+};
 use structopt::StructOpt;
 use tokio_stream::StreamExt;
 
@@ -34,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         args.udp_port,
         args.udp_cleanup_interval,
         args.udp_timeout,
-        args.udp_max_outbound_sockets,
+        Arc::new(AtomicUsize::new(args.udp_max_outbound_sockets)),
     )
     .await?;
 
