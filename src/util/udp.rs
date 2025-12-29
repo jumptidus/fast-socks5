@@ -8,7 +8,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::oneshot, task::JoinHandle};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 
 use crate::{new_udp_header, parse_udp_request};
 
@@ -22,6 +26,8 @@ const UDP_BUFFER_SIZE: usize = 0x10000; // 64KB
 
 /// 默认的最大 outbound socket 数量，防止资源耗尽
 pub const DEFAULT_MAX_OUTBOUND_SOCKETS: usize = 128;
+/// UDP 直连驱动的默认响应队列长度
+pub const DEFAULT_UDP_DRIVER_QUEUE: usize = 1024;
 
 // ============================================================================
 // 突发限流
@@ -104,6 +110,35 @@ struct OutboundEntry {
     burst_permit: Option<BurstPermit>,
 }
 
+/// UDP 响应包（从目标返回给客户端）
+#[derive(Debug)]
+pub struct UdpPacket {
+    pub client_addr: SocketAddr,
+    pub data: Vec<u8>,
+}
+
+enum ResponseSink {
+    Socket(Arc<UdpSocket>),
+    Channel(mpsc::Sender<UdpPacket>),
+}
+
+impl ResponseSink {
+    async fn send(&self, client_addr: SocketAddr, data: Vec<u8>) -> Result<bool> {
+        match self {
+            ResponseSink::Socket(socket) => {
+                socket.send_to(&data, client_addr).await?;
+                Ok(false)
+            }
+            ResponseSink::Channel(tx) => {
+                if tx.send(UdpPacket { client_addr, data }).await.is_err() {
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+        }
+    }
+}
+
 // ============================================================================
 // 工具函数
 // ============================================================================
@@ -122,11 +157,11 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 }
 
 // ============================================================================
-// UdpManager
+// UdpCore
 // ============================================================================
 
-struct UdpManager {
-    inbound: Arc<UdpSocket>,
+struct UdpCore {
+    response_sink: Arc<ResponseSink>,
     /// key -> outbound entry
     outbound_map: Arc<DashMap<OutboundKey, OutboundEntry>>,
     client_map: Arc<DashMap<ClientKey, (SocketAddr, Instant)>>,
@@ -136,28 +171,21 @@ struct UdpManager {
     burst_limiter: Option<Arc<BurstLimiter>>,
 }
 
-impl UdpManager {
-    async fn new(
-        udp_port: u16,
+impl UdpCore {
+    fn new(
+        response_sink: Arc<ResponseSink>,
         max_outbound_sockets: Arc<AtomicUsize>,
         burst_limiter: Option<Arc<BurstLimiter>>,
-    ) -> Result<Self> {
-        let udp_addr = format!("127.0.0.1:{}", udp_port);
-        let udp_socket = UdpSocket::bind(&udp_addr)
-            .await
-            .with_context(|| format!("[UDP] 绑定端口 {} 失败", udp_addr))?;
-
-        info!("[UDP] 监听 UDP 请求: {}", &udp_addr);
-
-        Ok(Self {
-            inbound: Arc::new(udp_socket),
+    ) -> Self {
+        Self {
+            response_sink,
             outbound_map: Arc::new(DashMap::new()),
             client_map: Arc::new(DashMap::new()),
             active_outbound_listener_ports: Arc::new(DashSet::new()),
             task_handles: DashMap::new(),
             max_outbound_sockets,
             burst_limiter,
-        })
+        }
     }
 
     async fn handle_inbound_packet(
@@ -298,14 +326,14 @@ impl UdpManager {
         if self.active_outbound_listener_ports.insert(port) {
             trace!("[UDP] 启动端口 {} 的响应监听器", port);
 
-            let inbound = self.inbound.clone();
+            let response_sink = Arc::clone(&self.response_sink);
             let client_map = self.client_map.clone();
             let outbound_map = self.outbound_map.clone();
             let active_ports = self.active_outbound_listener_ports.clone();
 
             let (tx, rx) = oneshot::channel();
             let handle = tokio::spawn(listen_udp_response(
-                inbound,
+                response_sink,
                 outbound,
                 client_map,
                 outbound_map,
@@ -359,6 +387,98 @@ impl UdpManager {
         self.client_map
             .retain(|_, (_, last_used)| now.duration_since(*last_used) <= timeout);
     }
+
+    fn shutdown(&self) {
+        let ports: Vec<u16> = self.task_handles.iter().map(|e| *e.key()).collect();
+        for port in ports {
+            if let Some((_, (handle, tx))) = self.task_handles.remove(&port) {
+                trace!("[UDP] 停止端口 {} 的监听器", port);
+                if tx.send(()).is_err() {
+                    handle.abort();
+                }
+            }
+        }
+        self.active_outbound_listener_ports.clear();
+        self.outbound_map.clear();
+        self.client_map.clear();
+    }
+}
+
+// ============================================================================
+// UdpManager
+// ============================================================================
+
+struct UdpManager {
+    inbound: Arc<UdpSocket>,
+    core: Arc<UdpCore>,
+}
+
+impl UdpManager {
+    async fn new(
+        udp_port: u16,
+        max_outbound_sockets: Arc<AtomicUsize>,
+        burst_limiter: Option<Arc<BurstLimiter>>,
+    ) -> Result<Self> {
+        let udp_addr = format!("127.0.0.1:{}", udp_port);
+        let udp_socket = UdpSocket::bind(&udp_addr)
+            .await
+            .with_context(|| format!("[UDP] 绑定端口 {} 失败", udp_addr))?;
+
+        info!("[UDP] 监听 UDP 请求: {}", &udp_addr);
+
+        let inbound = Arc::new(udp_socket);
+        let response_sink = Arc::new(ResponseSink::Socket(Arc::clone(&inbound)));
+        let core = Arc::new(UdpCore::new(response_sink, max_outbound_sockets, burst_limiter));
+
+        Ok(Self { inbound, core })
+    }
+}
+
+// ============================================================================
+// UdpDriver
+// ============================================================================
+
+pub struct UdpDriver {
+    core: Arc<UdpCore>,
+}
+
+impl UdpDriver {
+    pub fn new(
+        max_outbound_sockets: Arc<AtomicUsize>,
+        burst_limiter: Option<Arc<BurstLimiter>>,
+    ) -> (Self, mpsc::Receiver<UdpPacket>) {
+        let (tx, rx) = mpsc::channel(DEFAULT_UDP_DRIVER_QUEUE);
+        let response_sink = Arc::new(ResponseSink::Channel(tx));
+        let core = Arc::new(UdpCore::new(response_sink, max_outbound_sockets, burst_limiter));
+        (Self { core }, rx)
+    }
+
+    pub async fn handle_inbound(&self, client_addr: SocketAddr, data: &[u8]) -> Result<()> {
+        self.core
+            .handle_inbound_packet(data, data.len(), client_addr)
+            .await
+    }
+
+    pub fn spawn_cleanup_task(
+        &self,
+        cleanup_interval: Duration,
+        timeout: Duration,
+    ) -> JoinHandle<()> {
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(cleanup_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tick.tick().await;
+                core.cleanup_expired_sockets(timeout);
+            }
+        })
+    }
+
+    pub fn shutdown(&self) {
+        self.core.shutdown();
+    }
 }
 
 // ============================================================================
@@ -386,12 +506,14 @@ pub async fn run_udp_server_with_burst(
         loop {
             tokio::select! {
                 result = udp_manager.inbound.recv_from(&mut buf) => {
-                    if let Err(e) = handle_recv_result(&udp_manager, &buf, result).await {
+                    if let Err(e) =
+                        handle_recv_result(udp_manager.core.as_ref(), &buf, result).await
+                    {
                         warn!("[UDP] 处理数据包失败: {:?}", e);
                     }
                 }
                 _ = tick.tick() => {
-                    udp_manager.cleanup_expired_sockets(timeout);
+                    udp_manager.core.cleanup_expired_sockets(timeout);
                 }
             }
         }
@@ -415,13 +537,13 @@ pub async fn run_udp_server(
 // ============================================================================
 
 async fn handle_recv_result(
-    state: &UdpManager,
+    core: &UdpCore,
     buf: &[u8],
     result: std::io::Result<(usize, SocketAddr)>,
 ) -> Result<()> {
     let (size, client_addr) = result?;
     trace!("[UDP] 收到来自 {} 的数据包", client_addr);
-    state.handle_inbound_packet(buf, size, client_addr).await
+    core.handle_inbound_packet(buf, size, client_addr).await
 }
 
 /// 从 OutboundKey 推导 client_addr
@@ -435,7 +557,7 @@ fn client_addr_from_outbound_key(outbound_key: &OutboundKey) -> SocketAddr {
 
 #[allow(clippy::too_many_arguments)]
 async fn listen_udp_response(
-    inbound: Arc<UdpSocket>,
+    response_sink: Arc<ResponseSink>,
     outbound: Arc<UdpSocket>,
     client_map: Arc<DashMap<ClientKey, (SocketAddr, Instant)>>,
     outbound_map: Arc<DashMap<OutboundKey, OutboundEntry>>,
@@ -483,9 +605,16 @@ async fn listen_udp_response(
                 let matched_client = client_map.get(&client_key).map(|e| e.value().0);
 
                 if let Some(client_addr) = matched_client {
-                    if let Err(e) = inbound.send_to(&data, client_addr).await {
-                        warn!("[UDP] 发送响应到 {} 失败: {:?}", client_addr, e);
-                        continue;
+                    match response_sink.send(client_addr, data).await {
+                        Ok(true) => {
+                            debug!("[UDP] 响应通道已关闭，停止监听器");
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!("[UDP] 发送响应到 {} 失败: {:?}", client_addr, e);
+                            continue;
+                        }
                     }
 
                     // 发送成功后重新获取锁刷新 last_used
@@ -519,9 +648,16 @@ async fn listen_udp_response(
                     // 从 outbound_key 推导 client_addr，O(1)
                     let client_addr = client_addr_from_outbound_key(&outbound_key);
 
-                    if let Err(e) = inbound.send_to(&data, client_addr).await {
-                        warn!("[UDP] 发送响应到 {} 失败: {:?}", client_addr, e);
-                        continue;
+                    match response_sink.send(client_addr, data).await {
+                        Ok(true) => {
+                            debug!("[UDP] 响应通道已关闭，停止监听器");
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!("[UDP] 发送响应到 {} 失败: {:?}", client_addr, e);
+                            continue;
+                        }
                     }
 
                     // 发送成功后重新获取锁刷新 outbound_map

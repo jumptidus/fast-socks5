@@ -184,7 +184,7 @@ impl<A: Authentication> Config<A> {
 /// Useful if you don't use any existing TcpListener's streams.
 pub struct Socks5Server<A: Authentication = DenyAuthentication> {
     listener: TcpListener,
-    udp_join_handle: JoinHandle<()>,
+    udp_join_handle: Option<JoinHandle<()>>,
     config: Arc<Config<A>>,
 }
 
@@ -215,34 +215,60 @@ impl<A: Authentication + Default> Socks5Server<A> {
         max_outbound_sockets: Arc<AtomicUsize>,
         burst_limiter: Option<Arc<BurstLimiter>>,
     ) -> io::Result<Self> {
-        let listener = TcpListener::bind(&addr).await?;
-        let config = Arc::new(Config::<A>::default());
-
-        match run_udp_server_with_burst(
-            udp_port,
+        Self::bind_with_burst_optional(
+            addr,
+            Some(udp_port),
             cleanup_interval,
             timeout,
             max_outbound_sockets,
             burst_limiter,
         )
         .await
-        {
-            Ok(udp_join_handle) => {
-                info!("[UDP] UDP 服务启动成功");
-                Ok(Socks5Server {
-                    listener,
-                    config,
-                    udp_join_handle,
-                })
+    }
+
+    pub async fn bind_with_burst_optional<S: AsyncToSocketAddrs>(
+        addr: S,
+        udp_port: Option<u16>,
+        cleanup_interval: u64,
+        timeout: u64,
+        max_outbound_sockets: Arc<AtomicUsize>,
+        burst_limiter: Option<Arc<BurstLimiter>>,
+    ) -> io::Result<Self> {
+        let listener = TcpListener::bind(&addr).await?;
+        let config = Arc::new(Config::<A>::default());
+
+        let udp_join_handle = if let Some(udp_port) = udp_port {
+            match run_udp_server_with_burst(
+                udp_port,
+                cleanup_interval,
+                timeout,
+                max_outbound_sockets,
+                burst_limiter,
+            )
+            .await
+            {
+                Ok(udp_join_handle) => {
+                    info!("[UDP] UDP 服务启动成功");
+                    Some(udp_join_handle)
+                }
+                Err(e) => {
+                    error!("[UDP] UDP 服务启动失败: {:?}", e);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("UDP 服务启动失败: {}", e),
+                    ));
+                }
             }
-            Err(e) => {
-                error!("[UDP] UDP 服务启动失败: {:?}", e);
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("UDP 服务启动失败: {}", e),
-                ))
-            }
-        }
+        } else {
+            info!("[UDP] UDP 服务未启用");
+            None
+        };
+
+        Ok(Socks5Server {
+            listener,
+            config,
+            udp_join_handle,
+        })
     }
 
     pub fn update_config(&mut self, config: Config<A>) {
@@ -252,7 +278,9 @@ impl<A: Authentication + Default> Socks5Server<A> {
 
 impl<A: Authentication> Drop for Socks5Server<A> {
     fn drop(&mut self) {
-        self.udp_join_handle.abort();
+        if let Some(handle) = self.udp_join_handle.as_ref() {
+            handle.abort();
+        }
     }
 }
 
@@ -825,11 +853,18 @@ where
 {
     match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
         Ok(res) => info!("transfer closed ({}, {})", res.0, res.1),
-        Err(err) => error!("transfer error: {:?}", err),
+        Err(err) => {
+            if err.kind() == io::ErrorKind::TimedOut {
+                debug!("传输空闲超时: {}", err);
+            } else {
+                error!("transfer error: {:?}", err);
+            }
+        }
     };
 
     Ok(())
 }
+
 
 // Fixes the issue "cannot borrow data in dereference of `Pin<&mut >` as mutable"
 //
@@ -959,11 +994,10 @@ mod tests {
     #[tokio::test]
     async fn incoming_accept_error_does_not_panic_on_next_poll() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let udp_join_handle = tokio::spawn(async move {});
 
         let server = Socks5Server {
             listener,
-            udp_join_handle,
+            udp_join_handle: None,
             config: Arc::new(Config::<DenyAuthentication>::default()),
         };
 
@@ -991,11 +1025,10 @@ mod tests {
     async fn incoming_next_cancelled_by_select_does_not_panic() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
-        let udp_join_handle = tokio::spawn(async move {});
 
         let server = Socks5Server {
             listener,
-            udp_join_handle,
+            udp_join_handle: None,
             config: Arc::new(Config::<DenyAuthentication>::default()),
         };
 
