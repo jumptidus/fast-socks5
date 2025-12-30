@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use dashmap::{DashMap, DashSet};
 use std::{
+    fmt,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -84,6 +85,27 @@ impl BurstLimiter {
         }
     }
 }
+
+// ============================================================================
+// 错误类型
+// ============================================================================
+
+#[derive(Debug)]
+pub struct UdpOutboundLimitReached {
+    pub max_outbound_sockets: usize,
+}
+
+impl fmt::Display for UdpOutboundLimitReached {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "UDP outbound socket 已达上限 ({})，且突发池耗尽",
+            self.max_outbound_sockets
+        )
+    }
+}
+
+impl std::error::Error for UdpOutboundLimitReached {}
 
 // ============================================================================
 // 类型定义
@@ -272,10 +294,10 @@ impl UdpCore {
                         .as_ref()
                         .and_then(|limiter| limiter.try_acquire());
                     let Some(permit) = permit else {
-                        anyhow::bail!(
-                            "[UDP] 已达到最大 socket 数量限制 ({})，且突发池耗尽，丢弃请求",
-                            max_outbound_sockets
-                        );
+                        return Err(UdpOutboundLimitReached {
+                            max_outbound_sockets,
+                        }
+                        .into());
                     };
 
                     let new_outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
