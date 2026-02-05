@@ -2,8 +2,8 @@ use crate::read_exact;
 use crate::ready;
 use crate::util::stream::tcp_connect_with_timeout;
 use crate::util::target_addr::{read_address, TargetAddr};
-use crate::util::udp::{run_udp_server_with_burst, BurstLimiter};
 pub use crate::util::udp::DEFAULT_MAX_OUTBOUND_SOCKETS;
+use crate::util::udp::{run_udp_server_with_burst, BurstLimiter};
 use crate::Socks5Command;
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
 use anyhow::Context;
@@ -864,7 +864,6 @@ where
 
     Ok(())
 }
-
 
 // Fixes the issue "cannot borrow data in dereference of `Pin<&mut >` as mutable"
 //
