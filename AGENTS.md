@@ -1,5 +1,23 @@
 # CLAUDE.md
 
+## 项目依赖关系（跨仓库）
+
+### 当前项目定位（fast-socks5）
+
+- `fast-socks5` 是异步 SOCKS5 库，提供 TCP/UDP 代理基础能力。
+- 当前主要被同仓库 `route_proxy` 依赖。
+
+### 依赖与边界
+
+- 对 `rathole`、`rathole_client`、`mobile`、`tis_windows` 无直接源码依赖。
+- 对外暴露的行为变更会间接影响 `route_proxy` 的连接稳定性。
+
+### 维护规则
+
+- 优先保持协议与错误语义稳定，减少上层适配成本。
+- 发生行为变更时，应同步验证 `route_proxy` 的转发与重试链路。
+
+
 ## 0 · 关于用户与你的角色
 
 - 你正在协助的对象是 **Snom**。
